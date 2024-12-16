@@ -19,6 +19,7 @@ AIO_FEED_TEMP = f"{AIO_USERNAME}/feeds/temp"
 # Pin configuration
 led = machine.Pin("LED", machine.Pin.OUT)
 relay = machine.Pin(2, machine.Pin.OUT)  # Replace 2 with the GPIO pin connected to your relay
+set_pin_drive_strength(14, 12)  # Set drive strength to 12mA
 
 setpoint = 40.0  # Default setpoint
 relay_state = False  # Track desired relay state
@@ -31,6 +32,32 @@ temp_sensor = TempSensorADT7410(i2c)  # Initialize the temperature sensor
 def log(message):
     if debug:
         print(message)
+
+def set_pin_drive_strength(pin, mA):
+    """Sets the drive strength of a GPIO pin.
+
+    Args:
+        pin (int): The pin number.
+        mA (int): The desired drive strength in mA (2, 4, 8, or 12).
+    """
+    
+    # Define the base address and offsets for the GPIO pad registers
+    PADS_BANK0_BASE = 0x4001C000
+    PAD_GPIO = PADS_BANK0_BASE + 0x04
+    PAD_GPIO_MPY = 4
+    PAD_DRIVE_BITS = 4
+
+    addr = PAD_GPIO + PAD_GPIO_MPY * pin
+    mem32[addr] &= 0xFFFFFFFF ^ (0b11 << PAD_DRIVE_BITS)
+
+    if mA <= 2:
+        mem32[addr] |= 0b00 << PAD_DRIVE_BITS
+    elif mA <= 4:
+        mem32[addr] |= 0b01 << PAD_DRIVE_BITS
+    elif mA <= 8:
+        mem32[addr] |= 0b10 << PAD_DRIVE_BITS
+    else:
+        mem32[addr] |= 0b11 << PAD_DRIVE_BITS
 
 def connect_to_wifi(ssid, password):
     wlan = network.WLAN(network.STA_IF)

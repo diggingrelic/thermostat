@@ -1,6 +1,8 @@
+# type: ignore
 import network
 import time
 import machine
+from machine import mem32
 import gc
 from umqtt.simple import MQTTClient
 from temp import TempSensorADT7410
@@ -16,22 +18,11 @@ AIO_FEED_RELAY = f"{AIO_USERNAME}/feeds/relay"
 AIO_FEED_SETPOINT = f"{AIO_USERNAME}/feeds/setpoint"
 AIO_FEED_TEMP = f"{AIO_USERNAME}/feeds/temp"
 
-# Pin configuration
-led = machine.Pin("LED", machine.Pin.OUT)
-relay = machine.Pin(2, machine.Pin.OUT)  # Replace 2 with the GPIO pin connected to your relay
-set_pin_drive_strength(14, 12)  # Set drive strength to 12mA
-
-setpoint = 40.0  # Default setpoint
-relay_state = False  # Track desired relay state
-current_relay_state = False  # Track actual relay state
-
-# I2C configuration for TempSensorADT7410
-i2c = machine.I2C(0, scl=machine.Pin(5), sda=machine.Pin(4), freq=100000)
-temp_sensor = TempSensorADT7410(i2c)  # Initialize the temperature sensor
-
-def log(message):
-    if debug:
-        print(message)
+# Define the base address and offsets for the GPIO pad registers
+PADS_BANK0_BASE = 0x4001C000
+PAD_GPIO = PADS_BANK0_BASE + 0x04
+PAD_GPIO_MPY = 4
+PAD_DRIVE_BITS = 4
 
 def set_pin_drive_strength(pin, mA):
     """Sets the drive strength of a GPIO pin.
@@ -40,12 +31,6 @@ def set_pin_drive_strength(pin, mA):
         pin (int): The pin number.
         mA (int): The desired drive strength in mA (2, 4, 8, or 12).
     """
-    
-    # Define the base address and offsets for the GPIO pad registers
-    PADS_BANK0_BASE = 0x4001C000
-    PAD_GPIO = PADS_BANK0_BASE + 0x04
-    PAD_GPIO_MPY = 4
-    PAD_DRIVE_BITS = 4
 
     addr = PAD_GPIO + PAD_GPIO_MPY * pin
     mem32[addr] &= 0xFFFFFFFF ^ (0b11 << PAD_DRIVE_BITS)
@@ -58,6 +43,24 @@ def set_pin_drive_strength(pin, mA):
         mem32[addr] |= 0b10 << PAD_DRIVE_BITS
     else:
         mem32[addr] |= 0b11 << PAD_DRIVE_BITS
+
+# Pin configuration
+led = machine.Pin("LED", machine.Pin.OUT)
+relay = machine.Pin(14, machine.Pin.OUT)  # Replace 2 with the GPIO pin connected to your relay
+set_pin_drive_strength(14, 12)  # Set drive strength to 12mA
+
+
+setpoint = 40.0  # Default setpoint
+relay_state = False  # Track desired relay state
+current_relay_state = False  # Track actual relay state
+
+# I2C configuration for TempSensorADT7410
+i2c = machine.I2C(0, scl=machine.Pin(5), sda=machine.Pin(4), freq=100000)
+temp_sensor = TempSensorADT7410(i2c)  # Initialize the temperature sensor
+
+def log(message):
+    if debug:
+        print(message)
 
 def connect_to_wifi(ssid, password):
     wlan = network.WLAN(network.STA_IF)

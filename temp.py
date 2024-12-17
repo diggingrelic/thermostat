@@ -1,5 +1,3 @@
-# type: ignore
-from machine import I2C, Pin
 import time
 
 class TempSensorADT7410:

@@ -1,3 +1,4 @@
 .vscode/settings.json
 micropython-env/*
 umqtt/simple.py
+.DS_Store

@@ -22,6 +22,7 @@ AIO_FEED_SETPOINT = f"{AIO_USERNAME}/feeds/setpoint"
 AIO_FEED_TEMP = f"{AIO_USERNAME}/feeds/temp"
 AIO_FEED_CYCLE_DELAY = f"{AIO_USERNAME}/feeds/cycle_delay"
 AIO_FEED_TEMP_DIFF = f"{AIO_USERNAME}/feeds/temp_diff"
+AIO_FEED_MIN_TIME_ON = f"{AIO_USERNAME}/feeds/min_time_on"
 
 # Define GPIO pad registers
 PADS_BANK0_BASE = 0x4001C000
@@ -54,6 +55,8 @@ current_relay_state = False  # Track actual relay state
 cycle_delay = 10  # Default cycle delay in minutes
 temp_diff = 2.0  # Default temperature differential in °F
 last_relay_change = 0  # Track when relay last changed state
+min_time_on = 15  # Default minimum on-time in minutes
+relay_on_start_time = 0  # Track when relay turned on
 
 # I2C configuration for TempSensorADT7410
 i2c = machine.I2C(0, scl=machine.Pin(5), sda=machine.Pin(4), freq=100000)
@@ -100,9 +103,11 @@ def blink_led(times, delay):
         time.sleep(delay)
 
 def mqtt_callback(topic, msg):
-    global setpoint, relay_state, temp_diff, cycle_delay, time_manager
+    global setpoint, relay_state, temp_diff, cycle_delay, min_time_on, time_manager
     topic_str = topic.decode() if isinstance(topic, bytes) else topic
     msg_str = msg.decode()
+    
+    log(f"MQTT message received - Topic: {topic_str}, Message: {msg_str}")  # Debug log
     
     if topic_str == "time/seconds":
         if time_manager:
@@ -112,12 +117,17 @@ def mqtt_callback(topic, msg):
         if new_relay_state != relay_state:
             relay_state = new_relay_state
             log(f"Relay state updated to: {relay_state}")
+        else:
+            log(f"Relay state unchanged: current={relay_state}, received={new_relay_state}")
     elif topic_str == AIO_FEED_SETPOINT:
         try:
             new_setpoint = float(msg_str)
             if new_setpoint != setpoint:
+                current = setpoint  # Store current value
                 setpoint = new_setpoint
-                log(f"Setpoint updated to: {setpoint}")
+                log(f"Setpoint: {current} -> {setpoint}")
+            else:
+                log(f"Setpoint unchanged: current={setpoint}, received={new_setpoint}")
         except ValueError:
             log("Invalid setpoint value received")
     elif topic_str == AIO_FEED_CYCLE_DELAY:
@@ -125,10 +135,13 @@ def mqtt_callback(topic, msg):
             new_cycle_delay = float(msg_str)
             if new_cycle_delay != cycle_delay:
                 if 5 <= new_cycle_delay <= 20:
+                    current = cycle_delay  # Store current value
                     cycle_delay = new_cycle_delay
-                    log(f"Cycle delay updated to: {cycle_delay} minutes")
+                    log(f"Cycle delay: {current} -> {cycle_delay} minutes")
                 else:
                     log(f"Invalid cycle delay value: {new_cycle_delay} (must be between 5-20 minutes)")
+            else:
+                log(f"Cycle delay unchanged: current={cycle_delay}, received={new_cycle_delay}")
         except ValueError:
             log("Invalid cycle delay value received")
     elif topic_str == AIO_FEED_TEMP_DIFF:
@@ -136,12 +149,29 @@ def mqtt_callback(topic, msg):
             new_temp_diff = float(msg_str)
             if new_temp_diff != temp_diff:
                 if 1 <= new_temp_diff <= 5:
+                    current = temp_diff  # Store current value
                     temp_diff = new_temp_diff
-                    log(f"Temperature differential updated to: {temp_diff}°F")
+                    log(f"Temperature differential: {current} -> {temp_diff}°F")
                 else:
                     log(f"Invalid temperature differential value: {new_temp_diff} (must be between 1-5°F)")
+            else:
+                log(f"Temperature differential unchanged: current={temp_diff}, received={new_temp_diff}")
         except ValueError:
             log("Invalid temperature differential value received")
+    elif topic_str == AIO_FEED_MIN_TIME_ON:
+        try:
+            new_min_time = float(msg_str)
+            if new_min_time != min_time_on:
+                if 5 <= new_min_time <= 60:
+                    current = min_time_on  # Store current value
+                    min_time_on = new_min_time
+                    log(f"Minimum on-time: {current} -> {min_time_on} minutes")
+                else:
+                    log(f"Invalid minimum on-time value: {new_min_time} (must be between 5-60 minutes)")
+            else:
+                log(f"Minimum on-time unchanged: current={min_time_on}, received={new_min_time}")
+        except ValueError:
+            log("Invalid minimum on-time value received")
 
 def get_valid_temperature():
     """Get valid temperature reading with retries"""
@@ -154,27 +184,24 @@ def get_valid_temperature():
 
 def get_initial_state(client, retries=3):
     """Fetch initial state with retries"""
-    global setpoint, temp_diff, cycle_delay, relay_state
+    global setpoint, temp_diff, cycle_delay, relay_state, min_time_on
     
-    log("Fetching initial state...")
-    received_values = set()
-    initial_request_time = time.time()
-    
-    # Request relay state first
-    client.publish(AIO_FEED_RELAY + "/get", "")
-    time.sleep(0.5)  # Small delay before other requests
-    
-    for attempt in range(retries):
-        # Only request values we haven't received yet
-        if 'setpoint' not in received_values:
-            client.publish(AIO_FEED_SETPOINT + "/get", "")
-        if 'cycle_delay' not in received_values:
-            client.publish(AIO_FEED_CYCLE_DELAY + "/get", "")
-        if 'temp_diff' not in received_values:
-            client.publish(AIO_FEED_TEMP_DIFF + "/get", "")
-        if 'relay' not in received_values:
-            client.publish(AIO_FEED_RELAY + "/get", "")
-            
+    for retry in range(retries):
+        log("Fetching initial state...")
+        received_values = set()
+        initial_request_time = time.time()
+        
+        # Request values one at a time with small delays
+        client.publish(AIO_FEED_RELAY + "/get", "")
+        time.sleep(0.5)  # Wait a bit before requesting other values
+        client.publish(AIO_FEED_SETPOINT + "/get", "")
+        time.sleep(0.1)
+        client.publish(AIO_FEED_CYCLE_DELAY + "/get", "")
+        time.sleep(0.1)
+        client.publish(AIO_FEED_TEMP_DIFF + "/get", "")
+        time.sleep(0.1)
+        client.publish(AIO_FEED_MIN_TIME_ON + "/get", "")
+        
         # Wait for responses with a 5-second timeout
         timeout = time.time() + 5
         while time.time() < timeout:
@@ -188,39 +215,28 @@ def get_initial_state(client, retries=3):
                     received_values.add('cycle_delay')
                 if temp_diff != 2.0:
                     received_values.add('temp_diff')
-                if 'relay' not in received_values and isinstance(relay_state, bool):
+                if min_time_on != 15:
+                    received_values.add('min_time_on')
+                if isinstance(relay_state, bool):  # Only add once we have a valid boolean
                     received_values.add('relay')
                 
                 # If we got all values, we're done
-                if len(received_values) >= 4:
-                    log(f"Received all initial values after {attempt + 1} attempts")
+                if len(received_values) >= 5:
+                    log(f"Received all initial values after {retry + 1} attempts")
                     return True
                     
             except Exception as e:
                 log(f"Error checking messages: {e}")
             
             time.sleep(0.1)
-            
+        
         # Log what we're still waiting for
-        missing = {'setpoint', 'cycle_delay', 'temp_diff', 'relay'} - received_values
-        log(f"Attempt {attempt + 1}: Still waiting for: {', '.join(missing)}")
+        missing = {'setpoint', 'cycle_delay', 'temp_diff', 'min_time_on', 'relay'} - received_values
+        log(f"Attempt {retry + 1}: Still waiting for: {', '.join(missing)}")
         
-        if attempt < retries - 1:
-            time.sleep(2)
+        if retry < retries - 1:  # Don't sleep after last attempt
+            time.sleep(1)
     
-    # After all retries, use defaults for missing values
-    if time.time() - initial_request_time > (retries * 7):
-        log("Using default values for missing settings:")
-        if 'setpoint' not in received_values:
-            log(f"- Setpoint: {setpoint}°F (default)")
-        if 'cycle_delay' not in received_values:
-            log(f"- Cycle Delay: {cycle_delay}min (default)")
-        if 'temp_diff' not in received_values:
-            log(f"- Temp Diff: {temp_diff}°F (default)")
-        if 'relay' not in received_values:
-            log(f"- Relay: {relay_state} (default)")
-        return True
-        
     return False
 
 # Add to global variables
@@ -246,6 +262,7 @@ def reconnect_with_backoff(client, attempts=5):
         try:
             log(f"Reconnecting to MQTT broker, attempt {attempt + 1}...")
             try:
+                client.sock.close()  # Explicitly close the socket
                 client.disconnect()
             except:
                 pass
@@ -253,14 +270,14 @@ def reconnect_with_backoff(client, attempts=5):
             time.sleep(delay)
             gc.collect()
             
-            client = create_mqtt_client()
+            client = create_mqtt_client()  # Create fresh client
             client.set_callback(mqtt_callback)
             client.connect()
             client.subscribe(AIO_FEED_RELAY)
             client.subscribe(AIO_FEED_SETPOINT)
             client.subscribe(AIO_FEED_CYCLE_DELAY)
             client.subscribe(AIO_FEED_TEMP_DIFF)
-            client.subscribe("time/seconds")
+            client.subscribe(AIO_FEED_MIN_TIME_ON)
             log("Reconnected and subscribed to feeds.")
             return client
             
@@ -274,7 +291,7 @@ def reconnect_with_backoff(client, attempts=5):
     return None
 
 def update_relay_state(temperature):
-    global current_relay_state, last_relay_change, last_logged_bounds
+    global current_relay_state, last_relay_change, last_logged_bounds, relay_on_start_time
     current_time = time.time()
     
     # Calculate temperature bounds using differential
@@ -287,6 +304,15 @@ def update_relay_state(temperature):
         log(f"Control bounds: {temp_low:.1f}°F to {temp_high:.1f}°F (Setpoint: {setpoint:.1f}°F ±{temp_diff:.1f}°F)")
         last_logged_bounds = current_bounds
     
+    # Check if relay is currently on
+    if current_relay_state:
+        # If on, check if minimum time has elapsed
+        time_on = current_time - relay_on_start_time
+        if time_on < (min_time_on * 60):
+            remaining = (min_time_on * 60) - time_on
+            log(f"Minimum on-time: {remaining:.1f} seconds remaining")
+            return  # Keep relay on
+    
     # Check if minimum cycle time has elapsed
     if current_time - last_relay_change < cycle_delay * 60:
         remaining = (cycle_delay * 60) - (current_time - last_relay_change)
@@ -298,9 +324,11 @@ def update_relay_state(temperature):
     if desired_relay_state != current_relay_state:
         current_relay_state = desired_relay_state
         last_relay_change = current_time
+        
         if current_relay_state:
             relay_pin.on()
             led.on()
+            relay_on_start_time = current_time  # Track when relay turns on
             log(f"Relay turned ON (Temperature {temperature:.1f}°F below high limit {temp_high:.1f}°F)")
         else:
             relay_pin.off()
@@ -341,7 +369,7 @@ last_logged_temp = None
 last_logged_bounds = None
 
 def main():
-    global time_manager, thermostat, temp_sensor, last_ping
+    global time_manager, thermostat, temp_sensor, last_ping, last_logged_temp
     
     if connect_to_wifi(SSID, PASSWORD):
         blink_led(5, 0.2)
@@ -354,11 +382,12 @@ def main():
             log("Attempting MQTT connection...")
             client.connect()
             log("MQTT connected successfully")
+            # Subscribe to all control feeds
             client.subscribe(AIO_FEED_RELAY)
             client.subscribe(AIO_FEED_SETPOINT)
             client.subscribe(AIO_FEED_CYCLE_DELAY)
             client.subscribe(AIO_FEED_TEMP_DIFF)
-            client.subscribe("time/seconds")
+            client.subscribe(AIO_FEED_MIN_TIME_ON)
             
             time_manager = TimeManager(client, log)
             
@@ -373,64 +402,54 @@ def main():
             log(f"Failed to connect to MQTT broker: {e}")
             return
 
+        # Initialize all tracking variables
         last_temp_update = time.time()
-        last_published_temp = None
-        last_ping = time.time()
+        last_ping = time.time()  # Keep ping monitoring
+        last_logged_temp = None
 
         try:
             while True:
                 try:
-                    client.check_msg()
+                    client.check_msg()  # Check for incoming messages from subscriptions
                     
-                    # Check if ping needed
                     current_time = time.time()
+                    
+                    # Keep connection health monitoring
                     if current_time - last_ping >= ping_interval:
                         if not ping_mqtt(client):
                             raise OSError("Ping failed")
                         last_ping = current_time
-                    
+
+                    # Time sync check (only when needed)
                     if time_manager:
-                        try:
-                            time_manager.check_sync_needed()
-                        except Exception as e:
-                            log(f"Time sync error: {e}")
-                except OSError as e:
-                    log(f"Error during MQTT message check: {e}")
-                    new_client = reconnect_with_backoff(client)
-                    if new_client:
-                        client = new_client
-                        client.subscribe("time/seconds")
-                        time_manager = TimeManager(client, log)
-                        last_ping = time.time()  # Reset ping timer after reconnect
-                    else:
-                        time.sleep(30)
+                        time_manager.check_sync_needed()
 
-                try:
-                    global last_logged_temp
-                    temperature = get_valid_temperature()
-                    current_time = time.time()
-                    
-                    # Only log if significant change
-                    if last_logged_temp is None or abs(temperature - last_logged_temp) > 0.5:
-                        log(f"Temp Reading: {temperature:.2f} °F")
-                        last_logged_temp = temperature
+                    try:
+                        temperature = get_valid_temperature()
                         
-                        # Publish temperature update if enough time has passed
-                        if current_time - last_temp_update >= 15:
-                            try:
-                                client.publish(AIO_FEED_TEMP, f"{temperature:.2f}")
-                                log(f"Published temperature update: {temperature:.2f}°F")
-                                last_temp_update = current_time
-                            except Exception as e:
-                                log(f"Error publishing temperature: {e}")
-                except RuntimeError as e:
-                    log(f"Error getting temperature: {e}")
-                    continue
+                        # Only log if significant change
+                        if last_logged_temp is None or abs(temperature - last_logged_temp) > 0.5:
+                            log(f"Temp Reading: {temperature:.2f} °F")
+                            last_logged_temp = temperature
+                            
+                        # Always publish every 60 seconds (no log)
+                        if current_time - last_temp_update >= 60:
+                            client.publish(AIO_FEED_TEMP, f"{temperature:.2f}")
+                            last_temp_update = current_time
+                    except RuntimeError as e:
+                        log(f"Error getting temperature: {e}")
+                        continue
 
-                update_relay_state(temperature)
-                log_wifi_status()
-                time.sleep(5)
-                gc.collect()
+                    update_relay_state(temperature)
+                    log_wifi_status()
+                    time.sleep(5)
+                    gc.collect()
+
+                except OSError as e:
+                    log(f"MQTT Error: {e}")
+                    client = reconnect_with_backoff(client)
+                    if not client:
+                        return
 
         except KeyboardInterrupt:
             log("Exiting...")

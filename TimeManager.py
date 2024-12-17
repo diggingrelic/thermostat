@@ -1,71 +1,51 @@
 # type: ignore
 import machine
 import time
+from mysecrets import AIO_USERNAME
 
 class TimeManager:
-    def __init__(self, mqtt_client, log_function):
+    def __init__(self, client, log_function):
         """
         Initialize TimeManager
         
         Args:
-            mqtt_client: MQTT client for Adafruit IO communication
+            client: MQTT client for Adafruit IO communication
             log_function: Function to use for logging
         """
-        self.client = mqtt_client
+        self.client = client
         self.log = log_function
-        self.time_feed = "time/seconds"
-        self.last_sync = 0
-        self.sync_interval = 43200  # 12 hours in seconds
-        self._has_synced = False  # Track if we've ever synced
-
-    def subscribe(self):
-        """Subscribe to time feed"""
-        try:
-            self.client.subscribe(self.time_feed)
-            return True
-        except Exception as e:
-            self.log(f"Error subscribing to time feed: {e}")
-            return False
+        self.last_sync = 0  # Track last sync time
+        self.sync_interval = 12 * 60 * 60  # 12 hours in seconds
+        self.check_sync_needed()  # Force sync on initialization
 
     def handle_time_message(self, msg):
         """Handle incoming time message from Adafruit"""
         try:
-            if not self._has_synced or (time.time() - self.last_sync >= self.sync_interval):
-                msg_str = msg.decode() if isinstance(msg, bytes) else msg
-                current_time = int(msg_str)
-                try:
-                    machine.RTC().datetime(time.localtime(current_time))
-                    self.last_sync = current_time
-                    self._has_synced = True
-                    self.log(f"System time updated from Adafruit: {time.localtime()}")
-                    return True
-                except Exception as e:
-                    self.log(f"Error setting RTC: {e}")
-                    return False
-            # else:
-            #    self.log("Time sync message received but not needed yet")  # Optional debug
-            return True  # Message handled successfully even if we didn't need it
-        except ValueError as e:
-            self.log(f"Invalid time value received: {e}")
-            return False
-
-    def sync_time(self):
-        """Request time sync from Adafruit"""
-        try:
-            self.client.publish(self.time_feed + "/get", "")
-            return True
+            current_time = int(msg.decode())
+            
+            # Only sync if we haven't synced yet (last_sync = 0) or if 12 hours have passed
+            if self.last_sync == 0 or (current_time - self.last_sync) >= self.sync_interval:
+                self.last_sync = current_time
+                # Convert epoch to tuple
+                time_tuple = time.gmtime(current_time)
+                machine.RTC().datetime((time_tuple[0], time_tuple[1], time_tuple[2], 
+                                      time_tuple[6] + 1, time_tuple[3], time_tuple[4], 
+                                      time_tuple[5], 0))
+                self.log(f"System time updated from Adafruit: {time_tuple}")
         except Exception as e:
-            self.log(f"Error requesting time sync: {e}")
-            return False
+            self.log(f"Error processing time message: {e}")
 
     def check_sync_needed(self):
-        """Check if time sync is needed based on sync interval"""
-        if not self._has_synced:
-            return self.sync_time()
+        """Check if time sync is needed based on current time"""
         current_time = time.time()
-        if current_time - self.last_sync >= self.sync_interval:
-            return self.sync_time()
-        return False
+        if self.last_sync == 0 or (current_time - self.last_sync) >= self.sync_interval:
+            # Subscribe, get time, then unsubscribe
+            self.client.subscribe("time/seconds")
+            self.client.publish(f"{AIO_USERNAME}/feeds/time/get", "")
+            # Wait briefly for response
+            for _ in range(10):  # Try for 1 second
+                self.client.check_msg()
+                time.sleep(0.1)
 
     def get_current_time(self):
         """Get current time as timestamp"""
@@ -73,7 +53,7 @@ class TimeManager:
 
     def has_valid_time(self):
         """Check if we have a valid time sync"""
-        return self._has_synced
+        return self.last_sync != 0
 
     def get_last_sync_time(self):
         """Get the last time we synced with Adafruit"""

@@ -7,6 +7,8 @@ import gc
 from umqtt.simple import MQTTClient
 from TempSensorADT7410 import TempSensorADT7410
 from mysecrets import SSID, PASSWORD, AIO_USERNAME, AIO_KEY  # Import secrets
+from HeaterController import HeaterController
+from ThermostatController import ThermostatController
 
 # Debug flag for verbose logging
 debug = True
@@ -17,6 +19,8 @@ AIO_PORT = 1883
 AIO_FEED_RELAY = f"{AIO_USERNAME}/feeds/relay"
 AIO_FEED_SETPOINT = f"{AIO_USERNAME}/feeds/setpoint"
 AIO_FEED_TEMP = f"{AIO_USERNAME}/feeds/temp"
+AIO_FEED_CYCLE_DELAY = f"{AIO_USERNAME}/feeds/cycle_delay"
+AIO_FEED_TEMP_DIFF = f"{AIO_USERNAME}/feeds/temp_diff"
 
 # Define the base address and offsets for the GPIO pad registers
 PADS_BANK0_BASE = 0x4001C000
@@ -44,15 +48,12 @@ def set_pin_drive_strength(pin, mA):
     else:
         mem32[addr] |= 0b11 << PAD_DRIVE_BITS
 
-# Pin configuration
+# Initialize controllers
 led = machine.Pin("LED", machine.Pin.OUT)
-relay = machine.Pin(14, machine.Pin.OUT)  # Replace 2 with the GPIO pin connected to your relay
-set_pin_drive_strength(14, 12)  # Set drive strength to 12mA
-
-
-setpoint = 40.0  # Default setpoint
-relay_state = False  # Track desired relay state
-current_relay_state = False  # Track actual relay state
+relay_pin = machine.Pin(14, machine.Pin.OUT)
+set_pin_drive_strength(14, 12)
+heater = HeaterController(relay_pin)
+thermostat = ThermostatController(heater, led)
 
 # I2C configuration for TempSensorADT7410
 i2c = machine.I2C(0, scl=machine.Pin(5), sda=machine.Pin(4), freq=100000)
@@ -98,16 +99,36 @@ def blink_led(times, duration):
         time.sleep(duration)
 
 def mqtt_callback(topic, msg):
-    global setpoint, relay_state
-    log(f"MQTT Message received: {topic.decode()} - {msg.decode()}")
-    if topic.decode() == AIO_FEED_RELAY:
-        relay_state = msg.decode().lower() == "on"
-    elif topic.decode() == AIO_FEED_SETPOINT:
-        try:
-            setpoint = float(msg.decode())
-            log(f"Setpoint updated to: {setpoint}")
-        except ValueError:
+    topic = topic.decode()
+    msg = msg.decode()
+    log(f"MQTT Message received: {topic} - {msg}")
+    
+    if topic == AIO_FEED_RELAY:
+        thermostat.set_enabled(msg)
+    elif topic == AIO_FEED_SETPOINT:
+        if thermostat.set_setpoint(msg):
+            log(f"Setpoint updated to: {msg}")
+        else:
             log("Invalid setpoint value received")
+    elif topic == AIO_FEED_CYCLE_DELAY:
+        try:
+            if heater.update_cycle_time(msg):
+                remaining_time = heater.get_remaining_cycle_time()
+                log(f"Cycle time updated to: {msg} minutes")
+                if remaining_time > 0:
+                    log(f"Remaining time in current cycle: {remaining_time/60:.1f} minutes")
+            else:
+                log(f"Invalid cycle time value: {msg} (must be between 5-20 minutes)")
+        except Exception as e:
+            log(f"Error updating cycle time: {e}")
+    elif topic == AIO_FEED_TEMP_DIFF:
+        try:
+            if heater.update_temp_differential(msg):
+                log(f"Temperature differential updated to: {msg}°F")
+            else:
+                log(f"Invalid temperature differential value: {msg} (must be between 1-5°F)")
+        except Exception as e:
+            log(f"Error updating temperature differential: {e}")
 
 def get_valid_temperature():
     """
@@ -122,9 +143,11 @@ def get_valid_temperature():
     raise RuntimeError("Failed to get a valid temperature reading.")
 
 def get_initial_state(client):
-    log("Fetching initial setpoint and relay state...")
+    log("Fetching initial setpoint, relay state, cycle delay, and temperature differential...")
     client.publish(AIO_FEED_SETPOINT + "/get", "")
     client.publish(AIO_FEED_RELAY + "/get", "")
+    client.publish(AIO_FEED_CYCLE_DELAY + "/get", "")
+    client.publish(AIO_FEED_TEMP_DIFF + "/get", "")
     time.sleep(2)
 
 def reconnect_with_backoff(client, attempts=5):
@@ -146,19 +169,9 @@ def reconnect_with_backoff(client, attempts=5):
     log("Failed to reconnect after multiple attempts.")
 
 def update_relay_state(temperature):
-    global current_relay_state
-    desired_relay_state = relay_state and temperature <= setpoint and setpoint >= 30
-
-    if desired_relay_state != current_relay_state:
-        current_relay_state = desired_relay_state
-        if current_relay_state:
-            relay.on()
-            led.on()
-            log("Relay turned ON (Temperature below setpoint)")
-        else:
-            relay.off()
-            led.off()
-            log("Relay turned OFF (Temperature above setpoint)")
+    status = thermostat.update(temperature)
+    if status:
+        log(status)
 
 last_wifi_status = None  # Track last Wi-Fi status
 last_wifi_check = 0  # Track last Wi-Fi status check
@@ -188,6 +201,8 @@ def main():
             client.connect()
             client.subscribe(AIO_FEED_RELAY)
             client.subscribe(AIO_FEED_SETPOINT)
+            client.subscribe(AIO_FEED_CYCLE_DELAY)
+            client.subscribe(AIO_FEED_TEMP_DIFF)
             get_initial_state(client)
         except Exception as e:
             log(f"Failed to connect to MQTT broker: {e}")

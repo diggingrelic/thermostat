@@ -15,7 +15,7 @@ class TimeManager:
         self.log = log_function
         self.time_feed = "time/seconds"
         self.last_sync = 0
-        self.sync_interval = 3600  # Sync every hour
+        self.sync_interval = 43200  # 12 hours in seconds
         self._has_synced = False  # Track if we've ever synced
 
     def subscribe(self):
@@ -30,16 +30,21 @@ class TimeManager:
     def handle_time_message(self, msg):
         """Handle incoming time message from Adafruit"""
         try:
-            current_time = int(msg.decode())
-            try:
-                machine.RTC().datetime(time.localtime(current_time))
-                self.last_sync = current_time
-                self._has_synced = True
-                self.log(f"System time updated from Adafruit: {time.localtime()}")
-                return True
-            except Exception as e:
-                self.log(f"Error setting RTC: {e}")
-                return False
+            if not self._has_synced or (time.time() - self.last_sync >= self.sync_interval):
+                msg_str = msg.decode() if isinstance(msg, bytes) else msg
+                current_time = int(msg_str)
+                try:
+                    machine.RTC().datetime(time.localtime(current_time))
+                    self.last_sync = current_time
+                    self._has_synced = True
+                    self.log(f"System time updated from Adafruit: {time.localtime()}")
+                    return True
+                except Exception as e:
+                    self.log(f"Error setting RTC: {e}")
+                    return False
+            # else:
+            #    self.log("Time sync message received but not needed yet")  # Optional debug
+            return True  # Message handled successfully even if we didn't need it
         except ValueError as e:
             self.log(f"Invalid time value received: {e}")
             return False

@@ -5,7 +5,7 @@ import machine
 from machine import mem32
 import gc
 from umqtt.simple import MQTTClient
-from temp import TempSensorADT7410
+from TempSensorADT7410 import TempSensorADT7410
 from secrets import SSID, PASSWORD, AIO_USERNAME, AIO_KEY  # Import secrets
 
 # Debug flag for verbose logging

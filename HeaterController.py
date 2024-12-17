@@ -1,46 +1,71 @@
-import time
-
+# type: ignore
 class HeaterController:
-    def __init__(self, relay_pin, cycle_time=600, temp_differential=2.0):  # 600 seconds = 10 minutes
+    def __init__(self, relay_pin, time_manager, cycle_time=600, temp_differential=2.0):
         """
         Initialize HeaterController with timing controls
         
         Args:
             relay_pin: machine.Pin object for controlling the relay
+            time_manager: TimeManager instance for accurate timing
             cycle_time: minimum time (seconds) between cycles (default: 10 minutes)
-            temp_differential: temperature differential in degrees Fahrenheit (default: 2°F)
+            temp_differential: temperature differential in °F (default: 2°F)
         """
         self.relay = relay_pin
+        self.time_manager = time_manager
         self.cycle_time = cycle_time
         self.temp_differential = temp_differential
         self.last_off_time = 0
         self.last_on_time = 0
         self._is_on = False
-        self._cycle_start = 0  # Track when the current cycle started
+        self.min_on_time = 900  # 15 minutes in seconds
 
     def can_turn_on(self):
         """Check if enough time has passed since last cycle to turn on"""
-        current_time = time.time()
+        if not self.time_manager.has_valid_time():
+            return False
+        current_time = self.time_manager.get_current_time()
         if not self._is_on and current_time - self.last_off_time < self.cycle_time:
             return False
         return True
 
-    def get_remaining_cycle_time(self):
-        """Get remaining time in current cycle (seconds)"""
-        if not self._is_on:
-            elapsed = time.time() - self.last_off_time
-            remaining = max(0, self.cycle_time - elapsed)
-            return remaining
-        return 0
+    def can_turn_off(self):
+        """Check if heater has been on for minimum time"""
+        if not self.time_manager.has_valid_time():
+            return True  # Allow turn off if time sync is invalid
+        if self._is_on:
+            elapsed_on_time = self.time_manager.get_current_time() - self.last_on_time
+            return elapsed_on_time >= self.min_on_time
+        return True
+
+    def should_turn_on(self, current_temp, setpoint):
+        """Determine if heater should turn on based on temperature differential"""
+        if self._is_on:
+            if not self.can_turn_off():
+                return True  # Must stay on to meet minimum time
+            return current_temp <= (setpoint + self.temp_differential)
+        else:
+            return current_temp <= (setpoint - self.temp_differential)
+
+    def turn_on(self):
+        """Attempt to turn on the heater, respecting cycle time"""
+        if self.can_turn_on():
+            self.relay.on()
+            self._is_on = True
+            self.last_on_time = self.time_manager.get_current_time()
+            return True
+        return False
+
+    def turn_off(self):
+        """Turn off the heater if minimum on time has been met"""
+        if self.can_turn_off():
+            self.relay.off()
+            self._is_on = False
+            self.last_off_time = self.time_manager.get_current_time()
+            return True
+        return False
 
     def update_cycle_time(self, minutes):
-        """
-        Update cycle time based on minutes value from feed
-        Args:
-            minutes: time in minutes (5-20)
-        Returns:
-            bool: True if update was successful
-        """
+        """Update cycle time based on minutes value from feed"""
         try:
             minutes = float(minutes)
             if 5 <= minutes <= 20:
@@ -50,42 +75,8 @@ class HeaterController:
         except (ValueError, TypeError):
             return False
 
-    def should_turn_on(self, current_temp, setpoint):
-        """Determine if heater should turn on based on temperature differential"""
-        if self._is_on:
-            # If already on, wait until we're above setpoint + differential
-            return current_temp <= (setpoint + self.temp_differential)
-        else:
-            # If off, wait until we're below setpoint - differential
-            return current_temp <= (setpoint - self.temp_differential)
-
-    def turn_on(self):
-        """Attempt to turn on the heater, respecting cycle time"""
-        if self.can_turn_on():
-            self.relay.on()
-            self._is_on = True
-            self.last_on_time = time.time()
-            return True
-        return False
-
-    def turn_off(self):
-        """Turn off the heater and record the time"""
-        self.relay.off()
-        self._is_on = False
-        self.last_off_time = time.time()
-
-    def is_on(self):
-        """Return current state of heater"""
-        return self._is_on
-
     def update_temp_differential(self, diff):
-        """
-        Update temperature differential
-        Args:
-            diff: temperature differential in °F (1-5)
-        Returns:
-            bool: True if update was successful
-        """
+        """Update temperature differential"""
         try:
             diff = float(diff)
             if 1 <= diff <= 5:
@@ -94,3 +85,17 @@ class HeaterController:
             return False
         except (ValueError, TypeError):
             return False
+
+    def get_status(self):
+        """Get current status of heater controller"""
+        current_time = self.time_manager.get_current_time()
+        return {
+            "is_on": self._is_on,
+            "cycle_time": self.cycle_time / 60,  # Convert to minutes
+            "temp_differential": self.temp_differential,
+            "min_on_time": self.min_on_time / 60,  # Convert to minutes
+            "time_since_last_off": current_time - self.last_off_time if self.last_off_time else 0,
+            "time_since_last_on": current_time - self.last_on_time if self.last_on_time else 0,
+            "can_turn_on": self.can_turn_on(),
+            "can_turn_off": self.can_turn_off()
+        }

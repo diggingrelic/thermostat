@@ -23,6 +23,8 @@ AIO_FEED_TEMP = f"{AIO_USERNAME}/feeds/temp"
 AIO_FEED_CYCLE_DELAY = f"{AIO_USERNAME}/feeds/cycle_delay"
 AIO_FEED_TEMP_DIFF = f"{AIO_USERNAME}/feeds/temp_diff"
 AIO_FEED_MIN_TIME_ON = f"{AIO_USERNAME}/feeds/min_time_on"
+AIO_FEED_HEATER_STATUS = f"{AIO_USERNAME}/feeds/heater_status"
+AIO_FEED_RUNTIME = f"{AIO_USERNAME}/feeds/runtime_mins"
 
 # Define GPIO pad registers
 PADS_BANK0_BASE = 0x4001C000
@@ -56,7 +58,10 @@ cycle_delay = 10  # Default cycle delay in minutes
 temp_diff = 2.0  # Default temperature differential in °F
 last_relay_change = 0  # Track when relay last changed state
 min_time_on = 15  # Default minimum on-time in minutes
-relay_on_start_time = 0  # Track when relay turned on
+heater_start_time = 0  # Track when heater turns on
+total_runtime = 0  # Track accumulated runtime in minutes
+heater_status = 0  # Track current heater status (0=off, 1=on)
+time_manager = None  # Initialize time_manager as None
 
 # I2C configuration for TempSensorADT7410
 i2c = machine.I2C(0, scl=machine.Pin(5), sda=machine.Pin(4), freq=100000)
@@ -103,11 +108,11 @@ def blink_led(times, delay):
         time.sleep(delay)
 
 def mqtt_callback(topic, msg):
-    global setpoint, relay_state, temp_diff, cycle_delay, min_time_on, time_manager
+    global setpoint, relay_state, temp_diff, cycle_delay, min_time_on, heater_status, total_runtime, time_manager
     topic_str = topic.decode() if isinstance(topic, bytes) else topic
     msg_str = msg.decode()
     
-    log(f"MQTT message received - Topic: {topic_str}, Message: {msg_str}")  # Debug log
+    log(f"MQTT message received - Topic: {topic_str}, Message: {msg_str}")
     
     if topic_str == "time/seconds":
         if time_manager:
@@ -116,9 +121,9 @@ def mqtt_callback(topic, msg):
         new_relay_state = msg_str.lower() == "on"
         if new_relay_state != relay_state:
             relay_state = new_relay_state
-            log(f"Relay state updated to: {relay_state}")
+            log(f"Relay command received: {relay_state} (Actual state: {current_relay_state}, min time holding: {current_relay_state and not relay_state})")
         else:
-            log(f"Relay state unchanged: current={relay_state}, received={new_relay_state}")
+            log(f"Relay command unchanged: command={relay_state}, actual={current_relay_state}")
     elif topic_str == AIO_FEED_SETPOINT:
         try:
             new_setpoint = float(msg_str)
@@ -134,12 +139,12 @@ def mqtt_callback(topic, msg):
         try:
             new_cycle_delay = float(msg_str)
             if new_cycle_delay != cycle_delay:
-                if 5 <= new_cycle_delay <= 20:
+                if 1 <= new_cycle_delay <= 20:
                     current = cycle_delay  # Store current value
                     cycle_delay = new_cycle_delay
                     log(f"Cycle delay: {current} -> {cycle_delay} minutes")
                 else:
-                    log(f"Invalid cycle delay value: {new_cycle_delay} (must be between 5-20 minutes)")
+                    log(f"Invalid cycle delay value: {new_cycle_delay} (must be between 1-20 minutes)")
             else:
                 log(f"Cycle delay unchanged: current={cycle_delay}, received={new_cycle_delay}")
         except ValueError:
@@ -162,16 +167,32 @@ def mqtt_callback(topic, msg):
         try:
             new_min_time = float(msg_str)
             if new_min_time != min_time_on:
-                if 5 <= new_min_time <= 60:
+                if 1 <= new_min_time <= 60:
                     current = min_time_on  # Store current value
                     min_time_on = new_min_time
                     log(f"Minimum on-time: {current} -> {min_time_on} minutes")
                 else:
-                    log(f"Invalid minimum on-time value: {new_min_time} (must be between 5-60 minutes)")
+                    log(f"Invalid minimum on-time value: {new_min_time} (must be between 1-60 minutes)")
             else:
                 log(f"Minimum on-time unchanged: current={min_time_on}, received={new_min_time}")
         except ValueError:
             log("Invalid minimum on-time value received")
+    elif topic_str == AIO_FEED_HEATER_STATUS:
+        try:
+            new_status = int(msg_str)
+            if new_status != heater_status:
+                heater_status = new_status
+                log(f"Heater status updated: {heater_status}")
+        except ValueError:
+            log("Invalid heater status value received")
+    elif topic_str == AIO_FEED_RUNTIME:
+        try:
+            new_runtime = float(msg_str)
+            if new_runtime != total_runtime:
+                total_runtime = new_runtime
+                log(f"Runtime updated: {total_runtime} minutes")
+        except ValueError:
+            log("Invalid runtime value received")
 
 def get_valid_temperature():
     """Get valid temperature reading with retries"""
@@ -184,16 +205,15 @@ def get_valid_temperature():
 
 def get_initial_state(client, retries=3):
     """Fetch initial state with retries"""
-    global setpoint, temp_diff, cycle_delay, relay_state, min_time_on
+    global setpoint, temp_diff, cycle_delay, relay_state, min_time_on, total_runtime
     
     for retry in range(retries):
         log("Fetching initial state...")
         received_values = set()
-        initial_request_time = time.time()
         
         # Request values one at a time with small delays
         client.publish(AIO_FEED_RELAY + "/get", "")
-        time.sleep(0.5)  # Wait a bit before requesting other values
+        time.sleep(0.5)
         client.publish(AIO_FEED_SETPOINT + "/get", "")
         time.sleep(0.1)
         client.publish(AIO_FEED_CYCLE_DELAY + "/get", "")
@@ -201,6 +221,9 @@ def get_initial_state(client, retries=3):
         client.publish(AIO_FEED_TEMP_DIFF + "/get", "")
         time.sleep(0.1)
         client.publish(AIO_FEED_MIN_TIME_ON + "/get", "")
+        time.sleep(0.1)
+        client.publish(AIO_FEED_RUNTIME + "/get", "")
+        time.sleep(0.1)
         
         # Wait for responses with a 5-second timeout
         timeout = time.time() + 5
@@ -217,11 +240,13 @@ def get_initial_state(client, retries=3):
                     received_values.add('temp_diff')
                 if min_time_on != 15:
                     received_values.add('min_time_on')
-                if isinstance(relay_state, bool):  # Only add once we have a valid boolean
+                if isinstance(relay_state, bool):
                     received_values.add('relay')
+                if isinstance(total_runtime, (int, float)):
+                    received_values.add('runtime')
                 
                 # If we got all values, we're done
-                if len(received_values) >= 5:
+                if len(received_values) >= 6:  # Updated count to 6
                     log(f"Received all initial values after {retry + 1} attempts")
                     return True
                     
@@ -231,10 +256,10 @@ def get_initial_state(client, retries=3):
             time.sleep(0.1)
         
         # Log what we're still waiting for
-        missing = {'setpoint', 'cycle_delay', 'temp_diff', 'min_time_on', 'relay'} - received_values
+        missing = {'setpoint', 'cycle_delay', 'temp_diff', 'min_time_on', 'relay', 'runtime'} - received_values
         log(f"Attempt {retry + 1}: Still waiting for: {', '.join(missing)}")
         
-        if retry < retries - 1:  # Don't sleep after last attempt
+        if retry < retries - 1:
             time.sleep(1)
     
     return False
@@ -290,8 +315,9 @@ def reconnect_with_backoff(client, attempts=5):
     log("Failed to reconnect after multiple attempts.")
     return None
 
-def update_relay_state(temperature):
-    global current_relay_state, last_relay_change, last_logged_bounds, relay_on_start_time
+def update_relay_state(temperature, client):
+    global current_relay_state, last_relay_change, last_logged_bounds
+    global heater_start_time, total_runtime, heater_status
     current_time = time.time()
     
     # Calculate temperature bounds using differential
@@ -306,18 +332,34 @@ def update_relay_state(temperature):
     
     # Check if relay is currently on
     if current_relay_state:
-        # If on, check if minimum time has elapsed
-        time_on = current_time - relay_on_start_time
-        if time_on < (min_time_on * 60):
+        time_on = current_time - heater_start_time
+        # If commanded OFF and minimum time met, turn off
+        if not relay_state and time_on >= (min_time_on * 60):
+            current_relay_state = False
+            last_relay_change = current_time  # Start cycle delay timer
+            relay_pin.off()
+            led.off()
+            heater_status = 0
+            # Calculate runtime for this session
+            if heater_start_time > 0:
+                runtime = (current_time - heater_start_time) / 60
+                total_runtime += runtime
+                client.publish(AIO_FEED_RUNTIME, str(int(total_runtime)))
+            client.publish(AIO_FEED_HEATER_STATUS, "0")
+            log(f"Relay turned OFF (minimum time elapsed)")
+            return
+        # If minimum time not met, stay on
+        elif not relay_state and time_on < (min_time_on * 60):
             remaining = (min_time_on * 60) - time_on
-            log(f"Minimum on-time: {remaining:.1f} seconds remaining")
-            return  # Keep relay on
+            log(f"Relay commanded OFF but held ON for minimum time: {remaining:.1f} seconds remaining")
+            return
     
-    # Check if minimum cycle time has elapsed
-    if current_time - last_relay_change < cycle_delay * 60:
-        remaining = (cycle_delay * 60) - (current_time - last_relay_change)
-        log(f"Cycle delay: {remaining:.1f} seconds remaining")
-        return
+    # Only check cycle delay if we're trying to turn ON
+    if not current_relay_state and relay_state:
+        if current_time - last_relay_change < cycle_delay * 60:
+            remaining = (cycle_delay * 60) - (current_time - last_relay_change)
+            log(f"Cycle delay: {remaining:.1f} seconds remaining")
+            return
     
     desired_relay_state = relay_state and temperature <= temp_high and setpoint >= 30
 
@@ -328,11 +370,20 @@ def update_relay_state(temperature):
         if current_relay_state:
             relay_pin.on()
             led.on()
-            relay_on_start_time = current_time  # Track when relay turns on
+            heater_start_time = current_time  # Track when relay turns on
+            heater_status = 1  # Update heater status
+            client.publish(AIO_FEED_HEATER_STATUS, "1")  # Publish status change
             log(f"Relay turned ON (Temperature {temperature:.1f}°F below high limit {temp_high:.1f}°F)")
         else:
             relay_pin.off()
             led.off()
+            heater_status = 0  # Update heater status
+            # Calculate runtime for this session
+            if heater_start_time > 0:
+                runtime = (current_time - heater_start_time) / 60  # Convert to minutes
+                total_runtime += runtime
+                client.publish(AIO_FEED_RUNTIME, str(int(total_runtime)))
+            client.publish(AIO_FEED_HEATER_STATUS, "0")  # Publish status change
             log(f"Relay turned OFF (Temperature {temperature:.1f}°F above low limit {temp_low:.1f}°F)")
 
 last_wifi_status = None
@@ -388,6 +439,7 @@ def main():
             client.subscribe(AIO_FEED_CYCLE_DELAY)
             client.subscribe(AIO_FEED_TEMP_DIFF)
             client.subscribe(AIO_FEED_MIN_TIME_ON)
+            client.subscribe(AIO_FEED_HEATER_STATUS)
             
             time_manager = TimeManager(client, log)
             
@@ -436,11 +488,12 @@ def main():
                         if current_time - last_temp_update >= 60:
                             client.publish(AIO_FEED_TEMP, f"{temperature:.2f}")
                             last_temp_update = current_time
+                            
+                        update_relay_state(temperature, client)
                     except RuntimeError as e:
                         log(f"Error getting temperature: {e}")
                         continue
 
-                    update_relay_state(temperature)
                     log_wifi_status()
                     time.sleep(5)
                     gc.collect()
@@ -457,3 +510,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

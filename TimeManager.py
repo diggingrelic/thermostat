@@ -40,7 +40,7 @@ class TimeManager:
         current_time = time.time()
         if self.last_sync == 0 or (current_time - self.last_sync) >= self.sync_interval:
             # Subscribe, get time, then unsubscribe
-            self.client.subscribe("time/seconds")
+            #self.client.subscribe("time/seconds")
             self.client.publish(f"{AIO_USERNAME}/feeds/time/get", "")
             # Wait briefly for response
             for _ in range(10):  # Try for 1 second

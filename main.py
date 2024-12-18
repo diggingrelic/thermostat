@@ -22,7 +22,6 @@ AIO_FEED_CYCLE_DELAY = f"{AIO_USERNAME}/feeds/cycle_delay"
 AIO_FEED_TEMP_DIFF = f"{AIO_USERNAME}/feeds/temp_diff"
 AIO_FEED_MIN_TIME_ON = f"{AIO_USERNAME}/feeds/min_time_on"
 AIO_FEED_HEATER_STATUS = f"{AIO_USERNAME}/feeds/heater_status"
-AIO_FEED_RUNTIME = f"{AIO_USERNAME}/feeds/runtime_mins"
 AIO_FEED_TIMER = f"{AIO_USERNAME}/feeds/timer"  # NEW: Timer feed
 AIO_FEED_STATUS = f"{AIO_USERNAME}/feeds/status"
 AIO_FEED_DAILY_COST = f"{AIO_USERNAME}/feeds/daily_cost"
@@ -78,6 +77,8 @@ last_status_message = ""  # Track last message to prevent duplicates
 
 last_daily_post = 0  # Track when we last posted daily cost
 daily_runtime = 0    # Track runtime for current day
+
+last_runtime_status = 0  # Track last runtime status message
 
 def log(message):
     if debug:
@@ -221,14 +222,6 @@ def mqtt_callback(topic, msg, client):
                 log(f"Heater status updated: {heater_status}")
         except ValueError:
             log("Invalid heater status value received")
-    elif topic_str == AIO_FEED_RUNTIME:
-        try:
-            new_runtime = parse_runtime(msg_str)
-            if new_runtime != total_runtime:
-                total_runtime = new_runtime
-                log(f"Runtime restored: {format_runtime(total_runtime)}")
-        except ValueError:
-            log("Invalid runtime value received")
     elif topic_str == AIO_FEED_TIMER:
         try:
             if msg_str.startswith('R:'):  # Handle remaining time updates
@@ -288,8 +281,6 @@ def get_initial_state(client, retries=3):
         client.publish(AIO_FEED_TEMP_DIFF + "/get", "")
         time.sleep(0.1)
         client.publish(AIO_FEED_MIN_TIME_ON + "/get", "")
-        time.sleep(0.1)
-        client.publish(AIO_FEED_RUNTIME + "/get", "")
         time.sleep(0.1)
         client.publish(AIO_FEED_TIMER + "/get", "")
         time.sleep(0.1)
@@ -421,8 +412,8 @@ def format_runtime(minutes):
     return f"{mins}m"
 
 def update_runtime(client, force_update=False):
-    """Update total runtime. Call periodically and when heater turns off."""
-    global total_runtime, heater_start_time, last_runtime_update
+    """Update runtime. Call periodically and when heater turns off."""
+    global daily_runtime, heater_start_time, last_runtime_update, last_runtime_status
     
     if current_relay_state and heater_start_time > 0:
         current_time = time.time()
@@ -436,17 +427,20 @@ def update_runtime(client, force_update=False):
         
         # Only update if significant change (> 1 minute) or forced
         if force_update or minutes_since_update >= 1:
-            total_runtime += minutes_since_update
+            daily_runtime += minutes_since_update
             last_runtime_update = current_time  # Remember when we did this update
             
-            formatted_time = format_runtime(total_runtime)
-            client.publish(AIO_FEED_RUNTIME, formatted_time)
+            # Send runtime status every 15 minutes
+            if current_time - last_runtime_status >= 900:  # 15 minutes = 900 seconds
+                send_status(client, f"OK RUNTIME: {format_runtime(daily_runtime)}")
+                last_runtime_status = current_time
+            
             if debug:
-                log(f"Runtime updated: {formatted_time}")
+                log(f"Runtime updated: {format_runtime(daily_runtime)}")
 
 def update_relay_state(temperature, client):
     global current_relay_state, last_relay_change, last_logged_bounds
-    global heater_start_time, total_runtime, heater_status
+    global heater_start_time, heater_status, last_runtime_update, last_runtime_status
     current_time = time.time()
     
     # Calculate temperature bounds using differential
@@ -471,6 +465,8 @@ def update_relay_state(temperature, client):
             led.off()
             heater_status = 0
             heater_start_time = 0  # Reset start time
+            last_runtime_update = 0  # Reset runtime update tracker
+            last_runtime_status = 0  # Reset runtime status tracker
             client.publish(AIO_FEED_HEATER_STATUS, "0")
             log("Relay turned OFF (minimum time elapsed)")
             return
@@ -512,6 +508,8 @@ def update_relay_state(temperature, client):
             led.off()
             heater_status = 0
             heater_start_time = 0  # Reset start time
+            last_runtime_update = 0  # Reset runtime update tracker
+            last_runtime_status = 0  # Reset runtime status tracker
             client.publish(AIO_FEED_HEATER_STATUS, "0")
             log(f"Relay turned OFF (Temperature {temperature:.1f}°F above high limit {temp_high:.1f}°F)")
 
@@ -674,6 +672,35 @@ def set_mqtt_connected(success=True):
     if debug:
         log(f"MQTT state changed to: {'CONNECTED' if success else 'DISCONNECTED'}")
 
+def update_daily_cost(client, force=False):
+    """Update daily cost at 10:45 PM or when forced"""
+    global daily_runtime, last_daily_post
+    
+    current_time = time.localtime()
+    
+    # Check if it's 10:45 PM (22:45) or if force update requested
+    if force or (current_time[3] == 22 and current_time[4] == 45):
+        # Only post once per day
+        if last_daily_post != current_time[7]:  # current_time[7] is day of year
+            # Convert runtime from minutes to hours and calculate cost
+            daily_cost = (daily_runtime / 60) * HEATER_COST_PER_HOUR
+            
+            try:
+                client.publish(AIO_FEED_DAILY_COST, f"{daily_cost:.2f}")
+                log(f"Daily cost posted: ${daily_cost:.2f} ({daily_runtime} minutes)")
+                send_status(client, f"OK DAILY: Cost=${daily_cost:.2f} Runtime={format_runtime(daily_runtime)}")
+                
+                # Add status message before reset
+                send_status(client, f"OK RESET: Daily runtime reset from {format_runtime(daily_runtime)} to 0")
+                
+                # Reset for next day
+                last_daily_post = current_time[7]
+                daily_runtime = 0
+                
+            except Exception as e:
+                log(f"Failed to post daily cost: {e}")
+                send_status(client, f"ERROR: Failed to post daily cost - {str(e)}")
+
 def main():
     global time_manager, thermostat, temp_sensor, last_ping, timer_end_time, current_timer_hours, relay_state, last_runtime_update
     
@@ -785,6 +812,11 @@ def main():
                             last_temp_update = current_time
                             
                         update_relay_state(temperature, client)
+                        
+                        # Update runtime and daily cost
+                        update_runtime(client)
+                        update_daily_cost(client)
+                        
                     except RuntimeError as e:
                         error_msg = f"ERROR: Temperature sensor - {str(e)}"
                         send_status(client, error_msg, force=True)

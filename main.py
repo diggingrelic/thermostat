@@ -4,7 +4,7 @@ import time
 import machine
 from machine import mem32
 import gc
-from umqtt.simple import MQTTClient
+from umqtt.simple2 import MQTTClient
 from TempSensorADT7410 import TempSensorADT7410
 from mysecrets import SSID, PASSWORD, AIO_USERNAME, AIO_KEY
 from TimeManager import TimeManager
@@ -33,6 +33,16 @@ PAD_GPIO = PADS_BANK0_BASE + 0x04
 PAD_GPIO_MPY = 4
 PAD_DRIVE_BITS = 4
 
+# MQTT States
+MQTT_STATE_DISCONNECTED = 0
+MQTT_STATE_CONNECTING = 1
+MQTT_STATE_CONNECTED = 2
+
+# WiFi States
+WIFI_STATE_DISCONNECTED = 0
+WIFI_STATE_CONNECTING = 1
+WIFI_STATE_CONNECTED = 2
+
 def set_pin_drive_strength(pin, mA):
     """Sets the drive strength of a GPIO pin."""
     addr = PAD_GPIO + PAD_GPIO_MPY * pin
@@ -52,6 +62,7 @@ led = machine.Pin("LED", machine.Pin.OUT)
 relay_pin = machine.Pin(14, machine.Pin.OUT)
 set_pin_drive_strength(14, 12)
 
+# Initialize state variables
 setpoint = 40.0  # Default setpoint
 relay_state = False  # Track desired relay state
 current_relay_state = False  # Track actual relay state
@@ -59,26 +70,42 @@ cycle_delay = 10  # Default cycle delay in minutes
 temp_diff = 2.0  # Default temperature differential in °F
 last_relay_change = 0  # Track when relay last changed state
 min_time_on = 15  # Default minimum on-time in minutes
+heater_status = 0  # Track current heater status (0=off, 1=on)
+timer_end_time = 0  # When timer should finish (0 = no timer)
+current_timer_hours = 0  # Current timer value for feed updates
+
+# Initialize runtime tracking
 heater_start_time = 0  # Track when heater turns on
 total_runtime = 0  # Track accumulated runtime in minutes
-heater_status = 0  # Track current heater status (0=off, 1=on)
+daily_runtime = 0  # Track runtime for current day
+
+# Initialize status tracking
+last_status_message = ""  # Track last message to prevent duplicates
+last_logged_temp = None  # Track last logged temperature
+last_logged_bounds = None  # Track last logged temperature bounds
+
+# Initialize connection state
+mqtt_state = MQTT_STATE_DISCONNECTED
+wifi_state = WIFI_STATE_DISCONNECTED
+
+# Initialize time management
 time_manager = None  # Initialize time_manager as None
 
 # I2C configuration for TempSensorADT7410
 i2c = machine.I2C(0, scl=machine.Pin(5), sda=machine.Pin(4), freq=100000)
 temp_sensor = TempSensorADT7410(i2c)
 
-timer_end_time = 0  # When timer should finish (0 = no timer)
-current_timer_hours = 0  # Current timer value for feed updates
-
 last_status_update = 0
 status_update_interval = 300  # 5 minutes for OK updates
-last_status_message = ""  # Track last message to prevent duplicates
+last_runtime_status = 0  # Track last runtime status message
 
 last_daily_post = 0  # Track when we last posted daily cost
-daily_runtime = 0    # Track runtime for current day
 
-last_runtime_status = 0  # Track last runtime status message
+last_wifi_status = None
+last_wifi_check = 0
+
+last_ping = 0
+ping_interval = 30  # seconds
 
 def log(message):
     if debug:
@@ -120,8 +147,17 @@ def blink_led(times, delay):
         led.off()
         time.sleep(delay)
 
-def mqtt_callback(topic, msg, client):
-    global setpoint, relay_state, temp_diff, cycle_delay, min_time_on, heater_status, total_runtime, time_manager, timer_end_time, current_timer_hours
+def mqtt_callback(topic, msg, retained=False, duplicate=False):
+    """
+    Callback for received subscription messages.
+    
+    Args:
+        topic: The topic the message was received on
+        msg: The message content
+        retained: Boolean indicating if this was a retained message
+        duplicate: Boolean indicating if this was a duplicate delivery
+    """
+    global client, setpoint, relay_state, temp_diff, cycle_delay, min_time_on, heater_status, current_timer_hours
     topic_str = topic.decode() if isinstance(topic, bytes) else topic
     msg_str = msg.decode()
     
@@ -306,24 +342,27 @@ def get_initial_state(client, retries=3):
     return False
 
 # Add to global variables
-MQTT_KEEPALIVE = 60  # Adafruit IO keepalive of 60 seconds
+MQTT_KEEPALIVE = 120  # Increase keepalive interval
 MQTT_RECONNECT_DELAY = 5  # 5 seconds between reconnection attempts
 
 def create_mqtt_client():
     """Create and configure MQTT client with proper settings"""
+    global client
     client = MQTTClient(
         client_id="pico",
         server=AIO_SERVER,
         port=AIO_PORT,
         user=AIO_USERNAME,
         password=AIO_KEY,
-        keepalive=MQTT_KEEPALIVE
+        keepalive=MQTT_KEEPALIVE,
+        socket_timeout=5,
+        message_timeout=10
     )
     return client
 
 def reconnect_with_backoff(client, attempts=5):
     """Reconnect to MQTT with exponential backoff"""
-    delay = MQTT_RETRY_DELAY
+    delay = MQTT_RECONNECT_DELAY
     for attempt in range(attempts):
         try:
             log(f"Reconnecting to MQTT broker, attempt {attempt + 1}...")
@@ -331,23 +370,14 @@ def reconnect_with_backoff(client, attempts=5):
             # Properly clean up the old client
             try:
                 client.disconnect()
-            except OSError:  # Socket errors or if sock is None
-                pass
-                
-            try:
-                if client.sock:
-                    client.sock.close()
-            except (OSError, AttributeError):  # Socket errors or if sock is None
+            except:
                 pass
             
-            # Add a small delay to ensure socket cleanup
-            time.sleep(1)
+            time.sleep(1)  # Ensure socket cleanup
             gc.collect()
-            time.sleep(.5)
 
-            # Create fresh client
             client = create_mqtt_client()
-            client.set_callback(lambda topic, msg: mqtt_callback(topic, msg, client))
+            client.set_callback(mqtt_callback)
             client.connect()
             
             # Add a small delay before subscribing
@@ -366,7 +396,7 @@ def reconnect_with_backoff(client, attempts=5):
             
             for feed in feeds:
                 client.subscribe(feed)
-                time.sleep(.5)  # Small delay between subscribes
+                time.sleep(0.1)
                 
             log("Reconnected and subscribed to feeds.")
             time.sleep(5)
@@ -494,8 +524,6 @@ def update_relay_state(temperature, client):
             client.publish(AIO_FEED_HEATER_STATUS, "0")
             log(f"Relay turned OFF (Temperature {temperature:.1f}°F above high limit {temp_high:.1f}°F)")
 
-last_wifi_status = None
-last_wifi_check = 0
 def log_wifi_status(client):
     """Monitor WiFi status and send meaningful updates"""
     global last_wifi_status, last_wifi_check
@@ -513,10 +541,6 @@ def log_wifi_status(client):
             last_wifi_status = current_status
         last_wifi_check = current_time
 
-# Add to global variables
-last_ping = 0
-ping_interval = 30  # seconds
-
 def ping_mqtt(client):
     """Send a ping to keep connection alive"""
     try:
@@ -525,21 +549,6 @@ def ping_mqtt(client):
     except Exception as e:
         log(f"Ping failed: {e}")
         return False
-
-# Add to global variables
-last_logged_temp = None
-last_logged_bounds = None
-
-# Add to globals
-MQTT_STATE_DISCONNECTED = 0
-MQTT_STATE_CONNECTING = 1
-MQTT_STATE_CONNECTED = 2
-
-mqtt_state = MQTT_STATE_DISCONNECTED
-
-def is_connected():
-    """Check if we have a valid MQTT connection"""
-    return mqtt_state == MQTT_STATE_CONNECTED
 
 def send_status(client, message, force=False):
     """
@@ -583,21 +592,12 @@ def send_status(client, message, force=False):
         except Exception as e:
             log(f"Failed to send status: {e}")
 
-# Add to globals
-WIFI_STATE_DISCONNECTED = 0
-WIFI_STATE_CONNECTING = 1
-WIFI_STATE_CONNECTED = 2
-
-wifi_state = WIFI_STATE_DISCONNECTED
-last_wifi_attempt = 0
-last_mqtt_attempt = 0
-WIFI_RETRY_DELAY = 10  # seconds
-MQTT_RETRY_DELAY = 30  # seconds
-
 def check_wifi_connection():
     """Monitor WiFi and attempt reconnection"""
     global wifi_state, last_wifi_attempt
     current_time = time.time()
+    last_wifi_attempt = 0
+    WIFI_RETRY_DELAY = 10  # seconds
     
     wlan = network.WLAN(network.STA_IF)
     if not wlan.isconnected():
@@ -637,6 +637,7 @@ def handle_mqtt_connection(client):
     """State machine for MQTT connection handling"""
     global mqtt_state, last_mqtt_attempt
     current_time = time.time()
+    MQTT_RETRY_DELAY = 30
     
     # Only attempt reconnection if WiFi is available
     if wifi_state != WIFI_STATE_CONNECTED:
@@ -690,13 +691,14 @@ def update_daily_cost(client, force=False):
                 send_status(client, f"ERROR: Failed to post daily cost - {str(e)}")
 
 def main():
+    global last_logged_temp, client
     global time_manager, thermostat, temp_sensor, last_ping, timer_end_time, current_timer_hours, relay_state, last_runtime_update
     
     if connect_to_wifi(SSID, PASSWORD):
         blink_led(5, 0.2)
 
         client = create_mqtt_client()
-        client.set_callback(lambda topic, msg: mqtt_callback(topic, msg, client))
+        client.set_callback(mqtt_callback)
         gc.collect()
         
         try:
@@ -755,8 +757,7 @@ def main():
         last_temp_update = time.time()
         last_ping = time.time()
         last_timer_check = time.time()
-        last_runtime_update = 0
-        last_logged_temp = None
+        last_runtime_update = time.time()
 
         try:
             while True:
@@ -851,4 +852,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

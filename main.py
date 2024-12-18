@@ -130,6 +130,12 @@ def mqtt_callback(topic, msg, client):
         new_relay_state = msg_str.lower() == "on"
         if new_relay_state != relay_state:
             relay_state = new_relay_state
+            # Clear timer if relay commanded OFF
+            if not relay_state and timer_end_time > 0:
+                timer_end_time = 0
+                current_timer_hours = 0
+                client.publish(AIO_FEED_TIMER, "0")  # Update timer feed
+                log("Timer cancelled due to relay OFF command")
             log(f"Relay command received: {relay_state} (Actual state: {current_relay_state}, min time holding: {current_relay_state and not relay_state})")
         else:
             log(f"Relay command unchanged: command={relay_state}, actual={current_relay_state}")
@@ -329,35 +335,60 @@ def reconnect_with_backoff(client, attempts=5):
     for attempt in range(attempts):
         try:
             log(f"Reconnecting to MQTT broker, attempt {attempt + 1}...")
-            try:
-                client.sock.close()  # Explicitly close the socket
-            except Exception as e:
-                log(f"Socket close error: {e}")
             
-            time.sleep(delay)
+            # Properly clean up the old client
+            try:
+                client.disconnect()
+            except:
+                pass
+                
+            try:
+                if client.sock:
+                    client.sock.close()
+            except:
+                pass
+            
+            # Add a small delay to ensure socket cleanup
+            time.sleep(0.5)
             gc.collect()
             
-            # Create fresh client instead of reusing
+            # Create fresh client
             client = create_mqtt_client()
+            
+            # Add a small delay before connecting
+            time.sleep(0.5)
+            
             client.set_callback(mqtt_callback)
             client.connect()
-            client.subscribe(AIO_FEED_RELAY)
-            client.subscribe(AIO_FEED_SETPOINT)
-            client.subscribe(AIO_FEED_CYCLE_DELAY)
-            client.subscribe(AIO_FEED_TEMP_DIFF)
-            client.subscribe(AIO_FEED_MIN_TIME_ON)
-            client.subscribe(AIO_FEED_TIMER)
+            
+            # Add a small delay after connecting before subscribing
+            time.sleep(0.5)
+            
+            # Subscribe to all feeds
+            feeds = [
+                AIO_FEED_RELAY,
+                AIO_FEED_SETPOINT,
+                AIO_FEED_CYCLE_DELAY,
+                AIO_FEED_TEMP_DIFF,
+                AIO_FEED_MIN_TIME_ON,
+                AIO_FEED_TIMER
+            ]
+            
+            for feed in feeds:
+                client.subscribe(feed)
+                time.sleep(0.1)  # Small delay between subscribes
+                
             log("Reconnected and subscribed to feeds.")
             send_status(client, "OK RECONNECT: MQTT restored")
             return client
-            
+
         except Exception as e:
             log(f"Reconnection attempt {attempt + 1} failed: {e}")
             send_status(client, f"ERROR: MQTT reconnect failed - attempt {attempt + 1}")
             delay *= 2  # Exponential backoff
             if attempt < attempts - 1:
                 time.sleep(delay)
-    
+
     log("Failed to reconnect after multiple attempts.")
     send_status(client, "ERROR: MQTT reconnection failed after all attempts")
     return None
@@ -474,50 +505,43 @@ last_logged_temp = None
 last_logged_bounds = None
 
 def send_status(client, message, force=False):
-    """
-    Send status update to status feed.
-    Args:
-        client: MQTT client
-        message: Status message without timestamp
-        force: If True, send even if duplicate
-    """
+    """Send status update to status feed."""
     global last_status_update, last_status_message
-    current_time = time.time()
     
-    # Don't send duplicate errors within 5 minutes unless forced
-    if (message.startswith("ERROR") and 
-        last_status_message.startswith("ERROR") and 
-        current_time - last_status_update < 300 and 
-        not force):
+    # Don't try to send if client's socket is invalid
+    if not client or not getattr(client, 'sock', None):
+        log(f"Status update skipped (no connection): {message}")
         return
         
-    # For OK messages, add current state
-    if message.startswith("OK") and not message.startswith("OK BOOT"):
-        temp = get_valid_temperature()
-        state_info = (f"Temp:{temp:.1f}°F Set:{setpoint:.1f}°F "
-                     f"Heat:{'ON' if current_relay_state else 'OFF'}")
-        if timer_end_time > 0:
-            hours_left = (timer_end_time - current_time) / 3600
-            state_info += f" Timer:{hours_left:.1f}h"
-        message = f"{message} - {state_info}"
+    current_time = time.time()
     
-    # Add timestamp to message
-    timestamp = time.localtime(current_time)
-    full_message = f"{message} {timestamp[0]}-{timestamp[1]:02d}-{timestamp[2]:02d} {timestamp[3]:02d}:{timestamp[4]:02d}:{timestamp[5]:02d}"
+    # For OK messages, add current state more concisely
+    if message.startswith("OK") and not message.startswith("OK BOOT"):
+        try:
+            temp = get_valid_temperature()
+            state = f"T:{temp:.1f}F S:{setpoint:.1f}F H:{'ON' if current_relay_state else 'OFF'}"
+            if timer_end_time > 0:
+                hours_left = (timer_end_time - current_time) / 3600
+                state += f" TMR:{hours_left:.1f}h"
+            message = f"{message} {state}"
+        except Exception as e:
+            log(f"Error building status message: {e}")
+            return
     
     # Only send if forced, message changed, or interval elapsed for OK messages
     if (force or 
-        full_message != last_status_message or 
+        message != last_status_message or 
         (message.startswith("OK") and current_time - last_status_update >= status_update_interval)):
         
         try:
-            client.publish(AIO_FEED_STATUS, full_message[:128])  # Limit to 128 chars
-            last_status_message = full_message
+            client.publish(AIO_FEED_STATUS, message[:128])
+            last_status_message = message
             last_status_update = current_time
             if debug:
-                log(f"Status update: {full_message}")
+                log(f"Status update: {message}")
         except Exception as e:
             log(f"Failed to send status: {e}")
+            # Don't try to send more status messages about the failure
 
 def main():
     global time_manager, thermostat, temp_sensor, last_ping, timer_end_time, current_timer_hours, relay_state
@@ -647,10 +671,34 @@ def main():
                     error_msg = f"ERROR: MQTT connection lost - {str(e)}"
                     send_status(client, error_msg, force=True)
                     log(f"MQTT Error: {e}")
-                    client = reconnect_with_backoff(client)
-                    if not client:
+                    
+                    # Add delay before reconnection attempt
+                    time.sleep(1)
+                    
+                    # Try to clean up the old client
+                    try:
+                        client.disconnect()
+                    except:
+                        pass
+                        
+                    try:
+                        if client.sock:
+                            client.sock.close()
+                    except:
+                        pass
+                    
+                    gc.collect()
+                    
+                    # Now try to reconnect
+                    new_client = reconnect_with_backoff(client)
+                    if not new_client:
                         send_status(client, "ERROR: Failed to reconnect MQTT")
                         return
+                        
+                    # If we got a new client, update our reference
+                    client = new_client
+                    # Add small delay after getting new client
+                    time.sleep(1)
 
         except KeyboardInterrupt:
             log("Exiting...")

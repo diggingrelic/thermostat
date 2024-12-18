@@ -370,14 +370,10 @@ def reconnect_with_backoff(client, attempts=5):
             
             # Create fresh client
             client = create_mqtt_client()
-            
-            # Add a small delay before connecting
-            time.sleep(0.5)
-            
-            client.set_callback(mqtt_callback)
+            client.set_callback(lambda topic, msg: mqtt_callback(topic, msg, client))
             client.connect()
             
-            # Add a small delay after connecting before subscribing
+            # Add a small delay before subscribing
             time.sleep(0.5)
             
             # Subscribe to all feeds
@@ -395,10 +391,12 @@ def reconnect_with_backoff(client, attempts=5):
                 time.sleep(0.1)  # Small delay between subscribes
                 
             log("Reconnected and subscribed to feeds.")
+            set_mqtt_connected(True)
             send_status(client, "OK RECONNECT: MQTT restored")
             return client
 
         except Exception as e:
+            set_mqtt_connected(False)
             log(f"Reconnection attempt {attempt + 1} failed: {e}")
             send_status(client, f"ERROR: MQTT reconnect failed - attempt {attempt + 1}")
             delay *= 2  # Exponential backoff
@@ -664,8 +662,15 @@ def handle_mqtt_connection(client):
                 
     return client
 
+def set_mqtt_connected(success=True):
+    """Set MQTT state and log the change"""
+    global mqtt_state
+    mqtt_state = MQTT_STATE_CONNECTED if success else MQTT_STATE_DISCONNECTED
+    if debug:
+        log(f"MQTT state changed to: {'CONNECTED' if success else 'DISCONNECTED'}")
+
 def main():
-    global time_manager, thermostat, temp_sensor, last_ping, timer_end_time, current_timer_hours, relay_state
+    global time_manager, thermostat, temp_sensor, last_ping, timer_end_time, current_timer_hours, relay_state, last_runtime_update
     
     if connect_to_wifi(SSID, PASSWORD):
         blink_led(5, 0.2)
@@ -678,8 +683,10 @@ def main():
             log("Attempting MQTT connection...")
             try:
                 client.connect()
+                set_mqtt_connected(True)
                 log("MQTT connected successfully")
             except OSError as e:
+                set_mqtt_connected(False)
                 error_code = str(e)
                 error_msg = {
                     "-2": "Network connection failed",
@@ -840,6 +847,11 @@ def main():
         except KeyboardInterrupt:
             log("Exiting...")
             client.disconnect()
+
+        except Exception as e:
+            log(f"Main loop error: {e}")
+            set_mqtt_connected(False)
+            time.sleep(1)
 
 if __name__ == "__main__":
     main()

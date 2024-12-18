@@ -25,6 +25,8 @@ AIO_FEED_HEATER_STATUS = f"{AIO_USERNAME}/feeds/heater_status"
 AIO_FEED_RUNTIME = f"{AIO_USERNAME}/feeds/runtime_mins"
 AIO_FEED_TIMER = f"{AIO_USERNAME}/feeds/timer"  # NEW: Timer feed
 AIO_FEED_STATUS = f"{AIO_USERNAME}/feeds/status"
+AIO_FEED_DAILY_COST = f"{AIO_USERNAME}/feeds/daily_cost"
+HEATER_COST_PER_HOUR = 0.90  # Cost in dollars per hour
 
 # Define GPIO pad registers
 PADS_BANK0_BASE = 0x4001C000
@@ -73,6 +75,9 @@ current_timer_hours = 0  # Current timer value for feed updates
 last_status_update = 0
 status_update_interval = 300  # 5 minutes for OK updates
 last_status_message = ""  # Track last message to prevent duplicates
+
+last_daily_post = 0  # Track when we last posted daily cost
+daily_runtime = 0    # Track runtime for current day
 
 def log(message):
     if debug:

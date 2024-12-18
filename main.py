@@ -204,7 +204,14 @@ def mqtt_callback(topic, msg, client):
             log("Invalid runtime value received")
     elif topic_str == AIO_FEED_TIMER:
         try:
-            if msg_str.startswith('R:'):  # Added: Skip our remaining time updates
+            if msg_str.startswith('R:'):  # Handle remaining time updates
+                if timer_end_time == 0:  # Only process if we're initializing
+                    hours = float(msg_str[2:])  # Skip "R:" prefix
+                    if hours > 0:  # If there's time remaining
+                        timer_end_time = time.time() + (hours * 3600)  # Convert to seconds
+                        current_timer_hours = hours
+                        relay_state = True
+                        log(f"Timer restored: {hours:.2f} hours remaining")
                 return
                 
             if msg_str.lower() in ('0', 'off'):
@@ -341,15 +348,18 @@ def reconnect_with_backoff(client, attempts=5):
             client.subscribe(AIO_FEED_MIN_TIME_ON)
             client.subscribe(AIO_FEED_TIMER)
             log("Reconnected and subscribed to feeds.")
+            send_status(client, "OK RECONNECT: MQTT restored")
             return client
             
         except Exception as e:
             log(f"Reconnection attempt {attempt + 1} failed: {e}")
+            send_status(client, f"ERROR: MQTT reconnect failed - attempt {attempt + 1}")
             delay *= 2  # Exponential backoff
             if attempt < attempts - 1:
                 time.sleep(delay)
     
     log("Failed to reconnect after multiple attempts.")
+    send_status(client, "ERROR: MQTT reconnection failed after all attempts")
     return None
 
 def update_relay_state(temperature, client):
@@ -430,6 +440,7 @@ def update_relay_state(temperature, client):
 last_wifi_status = None
 last_wifi_check = 0
 def log_wifi_status(client):
+    """Monitor WiFi status and send meaningful updates"""
     global last_wifi_status, last_wifi_check
     current_time = time.time()
     if current_time - last_wifi_check >= 10:
@@ -473,6 +484,23 @@ def send_status(client, message, force=False):
     global last_status_update, last_status_message
     current_time = time.time()
     
+    # Don't send duplicate errors within 5 minutes unless forced
+    if (message.startswith("ERROR") and 
+        last_status_message.startswith("ERROR") and 
+        current_time - last_status_update < 300 and 
+        not force):
+        return
+        
+    # For OK messages, add current state
+    if message.startswith("OK") and not message.startswith("OK BOOT"):
+        temp = get_valid_temperature()
+        state_info = (f"Temp:{temp:.1f}°F Set:{setpoint:.1f}°F "
+                     f"Heat:{'ON' if current_relay_state else 'OFF'}")
+        if timer_end_time > 0:
+            hours_left = (timer_end_time - current_time) / 3600
+            state_info += f" Timer:{hours_left:.1f}h"
+        message = f"{message} - {state_info}"
+    
     # Add timestamp to message
     timestamp = time.localtime(current_time)
     full_message = f"{message} {timestamp[0]}-{timestamp[1]:02d}-{timestamp[2]:02d} {timestamp[3]:02d}:{timestamp[4]:02d}:{timestamp[5]:02d}"
@@ -503,9 +531,29 @@ def main():
         
         try:
             log("Attempting MQTT connection...")
-            client.connect()
-            log("MQTT connected successfully")
-            send_status(client, "OK BOOT: MQTT connected", force=True)
+            try:
+                client.connect()
+                log("MQTT connected successfully")
+            except OSError as e:
+                error_code = str(e)
+                error_msg = {
+                    "-2": "Network connection failed",
+                    "-1": "Connection refused",
+                    "1": "Connection refused - incorrect protocol version",
+                    "2": "Connection refused - invalid client identifier",
+                    "3": "Connection refused - server unavailable",
+                    "4": "Connection refused - bad username or password",
+                    "5": "Connection refused - not authorised"
+                }.get(error_code, f"Unknown error ({error_code})")
+                
+                send_status(client, f"ERROR: MQTT connection - {error_msg}")
+                log(f"Failed to connect to MQTT broker: {error_msg}")
+                
+                # Try to reconnect
+                client = reconnect_with_backoff(client)
+                if not client:
+                    return
+            
             # Subscribe to all control feeds
             client.subscribe(AIO_FEED_RELAY)
             client.subscribe(AIO_FEED_SETPOINT)
@@ -513,7 +561,7 @@ def main():
             client.subscribe(AIO_FEED_TEMP_DIFF)
             client.subscribe(AIO_FEED_MIN_TIME_ON)
             client.subscribe(AIO_FEED_HEATER_STATUS)
-            client.subscribe(AIO_FEED_TIMER)  # Add this line
+            client.subscribe(AIO_FEED_TIMER)
             
             time_manager = TimeManager(client, log)
             
@@ -523,7 +571,8 @@ def main():
                 log("Failed to get initial state, restarting...")
                 return
             
-            send_status(client, "OK BOOT: Initial state received")
+            # Single boot status after everything is ready
+            send_status(client, "OK BOOT: System ready", force=True)
             log("Initial state received, starting temperature monitoring...")
             
         except Exception as e:
@@ -599,9 +648,7 @@ def main():
                     send_status(client, error_msg, force=True)
                     log(f"MQTT Error: {e}")
                     client = reconnect_with_backoff(client)
-                    if client:
-                        send_status(client, "OK RECONNECT: MQTT restored")
-                    else:
+                    if not client:
                         send_status(client, "ERROR: Failed to reconnect MQTT")
                         return
 

@@ -120,24 +120,6 @@ def blink_led(times, delay):
         led.off()
         time.sleep(delay)
 
-def parse_runtime(runtime_str):
-    """Convert 'Xh Ym' format back to minutes"""
-    try:
-        if 'h' in runtime_str and 'm' in runtime_str:
-            parts = runtime_str.split()
-            hours = int(parts[0].rstrip('h'))
-            mins = int(parts[1].rstrip('m'))
-            return (hours * 60) + mins
-        elif 'h' in runtime_str:
-            hours = int(runtime_str.rstrip('h'))
-            return hours * 60
-        elif 'm' in runtime_str:
-            return int(runtime_str.rstrip('m'))
-        else:
-            return float(runtime_str)  # fallback for old numeric format
-    except (ValueError, IndexError):
-        return 0
-
 def mqtt_callback(topic, msg, client):
     global setpoint, relay_state, temp_diff, cycle_delay, min_time_on, heater_status, total_runtime, time_manager, timer_end_time, current_timer_hours
     topic_str = topic.decode() if isinstance(topic, bytes) else topic
@@ -549,33 +531,44 @@ def ping_mqtt(client):
 last_logged_temp = None
 last_logged_bounds = None
 
+# Add to globals
+MQTT_STATE_DISCONNECTED = 0
+MQTT_STATE_CONNECTING = 1
+MQTT_STATE_CONNECTED = 2
+
+mqtt_state = MQTT_STATE_DISCONNECTED
+
 def is_connected():
     """Check if we have a valid MQTT connection"""
     return mqtt_state == MQTT_STATE_CONNECTED
 
 def send_status(client, message, force=False):
-    """Send status update to status feed."""
+    """
+    Send status update to status feed.
+    Args:
+        client: MQTT client
+        message: Status message without timestamp
+        force: If True, send even if duplicate
+    """
     global last_status_update, last_status_message
-    
-    # Don't try to send if client's socket is invalid or not connected
-    if not client or not getattr(client, 'sock', None) or not is_connected():
-        log(f"Status update skipped (no connection): {message}")
-        return
-        
     current_time = time.time()
     
-    # For OK messages, add current state more concisely
+    # Don't send duplicate errors within 5 minutes unless forced
+    if (message.startswith("ERROR") and 
+        last_status_message.startswith("ERROR") and 
+        current_time - last_status_update < 300 and 
+        not force):
+        return
+        
+    # For OK messages, add current state
     if message.startswith("OK") and not message.startswith("OK BOOT"):
-        try:
-            temp = get_valid_temperature()
-            state = f"T:{temp:.1f}F S:{setpoint:.1f}F H:{'ON' if current_relay_state else 'OFF'}"
-            if timer_end_time > 0:
-                hours_left = (timer_end_time - current_time) / 3600
-                state += f" TMR:{hours_left:.1f}h"
-            message = f"{message} {state}"
-        except Exception as e:
-            log(f"Error building status message: {e}")
-            return
+        temp = get_valid_temperature()
+        state_info = (f"T:{temp:.1f}F S:{setpoint:.1f}F "
+                     f"H:{'ON' if current_relay_state else 'OFF'}")
+        if timer_end_time > 0:
+            hours_left = (timer_end_time - current_time) / 3600
+            state_info += f" TMR:{hours_left:.1f}h"
+        message = f"{message} - {state_info}"
     
     # Only send if forced, message changed, or interval elapsed for OK messages
     if (force or 
@@ -583,7 +576,7 @@ def send_status(client, message, force=False):
         (message.startswith("OK") and current_time - last_status_update >= status_update_interval)):
         
         try:
-            client.publish(AIO_FEED_STATUS, message[:128])
+            client.publish(AIO_FEED_STATUS, message[:128])  # Limit to 128 chars
             last_status_message = message
             last_status_update = current_time
             if debug:
@@ -595,12 +588,8 @@ def send_status(client, message, force=False):
 WIFI_STATE_DISCONNECTED = 0
 WIFI_STATE_CONNECTING = 1
 WIFI_STATE_CONNECTED = 2
-MQTT_STATE_DISCONNECTED = 0
-MQTT_STATE_CONNECTING = 1
-MQTT_STATE_CONNECTED = 2
 
 wifi_state = WIFI_STATE_DISCONNECTED
-mqtt_state = MQTT_STATE_DISCONNECTED
 last_wifi_attempt = 0
 last_mqtt_attempt = 0
 WIFI_RETRY_DELAY = 10  # seconds
@@ -852,38 +841,9 @@ def main():
                     error_msg = f"ERROR: MQTT connection lost - {str(e)}"
                     send_status(client, error_msg, force=True)
                     log(f"MQTT Error: {e}")
-                    
-                    # Add delay before reconnection attempt
+                    set_mqtt_connected(False)
                     time.sleep(1)
-                    
-                    # Try to clean up the old client
-                    try:
-                        client.disconnect()
-                    except OSError:  # Specific to socket/network errors
-                        pass
-                        
-                    try:
-                        if client.sock:
-                            client.sock.close()
-                    except (OSError, AttributeError):  # Socket errors or if sock is None
-                        pass
-                    
-                    gc.collect()
-                    
-                    # Now try to reconnect
-                    new_client = reconnect_with_backoff(client)
-                    if not new_client:
-                        send_status(client, "ERROR: Failed to reconnect MQTT")
-                        return
-                        
-                    # If we got a new client, update our reference
-                    client = new_client
-                    # Add small delay after getting new client
-                    time.sleep(1)
-
-        except KeyboardInterrupt:
-            log("Exiting...")
-            client.disconnect()
+                    continue
 
         except Exception as e:
             log(f"Main loop error: {e}")

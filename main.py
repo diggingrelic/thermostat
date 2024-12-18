@@ -247,13 +247,13 @@ def get_valid_temperature():
 
 def get_initial_state(client, retries=3):
     """Fetch initial state with retries"""
-    global setpoint, temp_diff, cycle_delay, relay_state, min_time_on, total_runtime, timer_end_time, current_timer_hours
+    global setpoint, temp_diff, cycle_delay, relay_state, min_time_on
     
     for retry in range(retries):
         log("Fetching initial state...")
         received_values = set()
         
-        # Request values one at a time with small delays
+        # Request values
         client.publish(AIO_FEED_RELAY + "/get", "")
         time.sleep(0.5)
         client.publish(AIO_FEED_SETPOINT + "/get", "")
@@ -272,24 +272,22 @@ def get_initial_state(client, retries=3):
             try:
                 client.check_msg()
                 
-                # Check which values have been received
-                if setpoint != 40.0:
+                # Mark values as received when we get any response
+                if isinstance(setpoint, float):
                     received_values.add('setpoint')
-                if cycle_delay != 10:
+                if isinstance(cycle_delay, float):
                     received_values.add('cycle_delay')
-                if temp_diff != 2.0:
+                if isinstance(temp_diff, float):
                     received_values.add('temp_diff')
-                if min_time_on != 15:
+                if isinstance(min_time_on, float):
                     received_values.add('min_time_on')
                 if isinstance(relay_state, bool):
                     received_values.add('relay')
-                if isinstance(total_runtime, (int, float)):
-                    received_values.add('runtime')
-                if isinstance(current_timer_hours, (int, float)):
+                if isinstance(timer_end_time, (int, float)):
                     received_values.add('timer')
                 
                 # If we got all values, we're done
-                if len(received_values) >= 7:  # Updated count to 7
+                if len(received_values) >= 6:
                     log(f"Received all initial values after {retry + 1} attempts")
                     return True
                     
@@ -299,7 +297,7 @@ def get_initial_state(client, retries=3):
             time.sleep(0.1)
         
         # Log what we're still waiting for
-        missing = {'setpoint', 'cycle_delay', 'temp_diff', 'min_time_on', 'relay', 'runtime', 'timer'} - received_values
+        missing = {'setpoint', 'cycle_delay', 'temp_diff', 'min_time_on', 'relay', 'timer'} - received_values
         log(f"Attempt {retry + 1}: Still waiting for: {', '.join(missing)}")
         
         if retry < retries - 1:
@@ -343,16 +341,17 @@ def reconnect_with_backoff(client, attempts=5):
                 pass
             
             # Add a small delay to ensure socket cleanup
-            time.sleep(0.5)
+            time.sleep(1)
             gc.collect()
-            
+            time.sleep(.5)
+
             # Create fresh client
             client = create_mqtt_client()
             client.set_callback(lambda topic, msg: mqtt_callback(topic, msg, client))
             client.connect()
             
             # Add a small delay before subscribing
-            time.sleep(0.5)
+            time.sleep(1)
             
             # Subscribe to all feeds
             feeds = [
@@ -361,14 +360,16 @@ def reconnect_with_backoff(client, attempts=5):
                 AIO_FEED_CYCLE_DELAY,
                 AIO_FEED_TEMP_DIFF,
                 AIO_FEED_MIN_TIME_ON,
+                AIO_FEED_HEATER_STATUS,
                 AIO_FEED_TIMER
             ]
             
             for feed in feeds:
                 client.subscribe(feed)
-                time.sleep(0.1)  # Small delay between subscribes
+                time.sleep(.5)  # Small delay between subscribes
                 
             log("Reconnected and subscribed to feeds.")
+            time.sleep(5)
             set_mqtt_connected(True)
             send_status(client, "OK RECONNECT: MQTT restored")
             return client
@@ -376,13 +377,11 @@ def reconnect_with_backoff(client, attempts=5):
         except Exception as e:
             set_mqtt_connected(False)
             log(f"Reconnection attempt {attempt + 1} failed: {e}")
-            send_status(client, f"ERROR: MQTT reconnect failed - attempt {attempt + 1}")
             delay *= 2  # Exponential backoff
             if attempt < attempts - 1:
                 time.sleep(delay)
 
     log("Failed to reconnect after multiple attempts.")
-    send_status(client, "ERROR: MQTT reconnection failed after all attempts")
     return None
 
 def format_runtime(minutes):

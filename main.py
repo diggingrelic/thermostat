@@ -26,6 +26,7 @@ AIO_FEED_MIN_TIME_ON = f"{AIO_USERNAME}/feeds/min_time_on"
 AIO_FEED_HEATER_STATUS = f"{AIO_USERNAME}/feeds/heater_status"
 AIO_FEED_RUNTIME = f"{AIO_USERNAME}/feeds/runtime_mins"
 AIO_FEED_TIMER = f"{AIO_USERNAME}/feeds/timer"  # NEW: Timer feed
+AIO_FEED_STATUS = f"{AIO_USERNAME}/feeds/status"
 
 # Define GPIO pad registers
 PADS_BANK0_BASE = 0x4001C000
@@ -70,6 +71,10 @@ temp_sensor = TempSensorADT7410(i2c)
 
 timer_end_time = 0  # When timer should finish (0 = no timer)
 current_timer_hours = 0  # Current timer value for feed updates
+
+last_status_update = 0
+status_update_interval = 300  # 5 minutes for OK updates
+last_status_message = ""  # Track last message to prevent duplicates
 
 def log(message):
     if debug:
@@ -319,14 +324,14 @@ def reconnect_with_backoff(client, attempts=5):
             log(f"Reconnecting to MQTT broker, attempt {attempt + 1}...")
             try:
                 client.sock.close()  # Explicitly close the socket
-                client.disconnect()
             except Exception as e:
-                log(f"Disconnect error: {e}")
+                log(f"Socket close error: {e}")
             
             time.sleep(delay)
             gc.collect()
             
-            client = create_mqtt_client()  # Create fresh client
+            # Create fresh client instead of reusing
+            client = create_mqtt_client()
             client.set_callback(mqtt_callback)
             client.connect()
             client.subscribe(AIO_FEED_RELAY)
@@ -334,7 +339,7 @@ def reconnect_with_backoff(client, attempts=5):
             client.subscribe(AIO_FEED_CYCLE_DELAY)
             client.subscribe(AIO_FEED_TEMP_DIFF)
             client.subscribe(AIO_FEED_MIN_TIME_ON)
-            client.subscribe(AIO_FEED_TIMER)  # NEW: Subscribe to timer feed
+            client.subscribe(AIO_FEED_TIMER)
             log("Reconnected and subscribed to feeds.")
             return client
             
@@ -424,7 +429,7 @@ def update_relay_state(temperature, client):
 
 last_wifi_status = None
 last_wifi_check = 0
-def log_wifi_status():
+def log_wifi_status(client):
     global last_wifi_status, last_wifi_check
     current_time = time.time()
     if current_time - last_wifi_check >= 10:
@@ -433,8 +438,10 @@ def log_wifi_status():
         if current_status != last_wifi_status:
             if current_status:
                 log(f"Wi-Fi connected, IP: {wlan.ifconfig()[0]}")
+                send_status(client, "OK RECONNECT: WiFi restored")
             else:
                 log("Wi-Fi disconnected.")
+                send_status(client, "ERROR: WiFi disconnected")
             last_wifi_status = current_status
         last_wifi_check = current_time
 
@@ -455,6 +462,35 @@ def ping_mqtt(client):
 last_logged_temp = None
 last_logged_bounds = None
 
+def send_status(client, message, force=False):
+    """
+    Send status update to status feed.
+    Args:
+        client: MQTT client
+        message: Status message without timestamp
+        force: If True, send even if duplicate
+    """
+    global last_status_update, last_status_message
+    current_time = time.time()
+    
+    # Add timestamp to message
+    timestamp = time.localtime(current_time)
+    full_message = f"{message} {timestamp[0]}-{timestamp[1]:02d}-{timestamp[2]:02d} {timestamp[3]:02d}:{timestamp[4]:02d}:{timestamp[5]:02d}"
+    
+    # Only send if forced, message changed, or interval elapsed for OK messages
+    if (force or 
+        full_message != last_status_message or 
+        (message.startswith("OK") and current_time - last_status_update >= status_update_interval)):
+        
+        try:
+            client.publish(AIO_FEED_STATUS, full_message[:128])  # Limit to 128 chars
+            last_status_message = full_message
+            last_status_update = current_time
+            if debug:
+                log(f"Status update: {full_message}")
+        except Exception as e:
+            log(f"Failed to send status: {e}")
+
 def main():
     global time_manager, thermostat, temp_sensor, last_ping, timer_end_time, current_timer_hours, relay_state
     
@@ -469,6 +505,7 @@ def main():
             log("Attempting MQTT connection...")
             client.connect()
             log("MQTT connected successfully")
+            send_status(client, "OK BOOT: MQTT connected", force=True)
             # Subscribe to all control feeds
             client.subscribe(AIO_FEED_RELAY)
             client.subscribe(AIO_FEED_SETPOINT)
@@ -482,9 +519,11 @@ def main():
             
             # Wait for initial state before proceeding
             if not get_initial_state(client):
+                send_status(client, "ERROR: Failed to get initial state")
                 log("Failed to get initial state, restarting...")
                 return
             
+            send_status(client, "OK BOOT: Initial state received")
             log("Initial state received, starting temperature monitoring...")
             
         except Exception as e:
@@ -521,6 +560,7 @@ def main():
                         if last_logged_temp is None or abs(temperature - last_logged_temp) > 0.5:
                             log(f"Temp Reading: {temperature:.2f} °F")
                             last_logged_temp = temperature
+                            send_status(client, "OK")  # Periodic OK status
                             
                         # Always publish every 60 seconds (no log)
                         if current_time - last_temp_update >= 60:
@@ -529,10 +569,12 @@ def main():
                             
                         update_relay_state(temperature, client)
                     except RuntimeError as e:
+                        error_msg = f"ERROR: Temperature sensor - {str(e)}"
+                        send_status(client, error_msg, force=True)
                         log(f"Error getting temperature: {e}")
                         continue
 
-                    log_wifi_status()
+                    log_wifi_status(client)
                     time.sleep(5)
                     gc.collect()
 
@@ -553,9 +595,14 @@ def main():
                             last_timer_check = current_time
 
                 except OSError as e:
+                    error_msg = f"ERROR: MQTT connection lost - {str(e)}"
+                    send_status(client, error_msg, force=True)
                     log(f"MQTT Error: {e}")
                     client = reconnect_with_backoff(client)
-                    if not client:
+                    if client:
+                        send_status(client, "OK RECONNECT: MQTT restored")
+                    else:
+                        send_status(client, "ERROR: Failed to reconnect MQTT")
                         return
 
         except KeyboardInterrupt:

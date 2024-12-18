@@ -393,7 +393,11 @@ def update_relay_state(temperature, client):
             log(f"Cycle delay: {remaining:.1f} seconds remaining")
             return
     
-    desired_relay_state = relay_state and temperature <= temp_high and setpoint >= 30
+    # Changed: Proper differential logic
+    desired_relay_state = relay_state and setpoint >= 30 and (
+        (not current_relay_state and temperature <= temp_low) or  # Turn ON below low limit
+        (current_relay_state and temperature <= temp_high)        # Stay ON until high limit
+    )
 
     if desired_relay_state != current_relay_state:
         current_relay_state = desired_relay_state
@@ -405,7 +409,7 @@ def update_relay_state(temperature, client):
             heater_start_time = current_time  # Track when relay turns on
             heater_status = 1  # Update heater status
             client.publish(AIO_FEED_HEATER_STATUS, "1")  # Publish status change
-            log(f"Relay turned ON (Temperature {temperature:.1f}°F below high limit {temp_high:.1f}°F)")
+            log(f"Relay turned ON (Temperature {temperature:.1f}°F below low limit {temp_low:.1f}°F)")
         else:
             relay_pin.off()
             led.off()
@@ -416,7 +420,7 @@ def update_relay_state(temperature, client):
                 total_runtime += runtime
                 client.publish(AIO_FEED_RUNTIME, str(int(total_runtime)))
             client.publish(AIO_FEED_HEATER_STATUS, "0")  # Publish status change
-            log(f"Relay turned OFF (Temperature {temperature:.1f}°F above low limit {temp_low:.1f}°F)")
+            log(f"Relay turned OFF (Temperature {temperature:.1f}°F above high limit {temp_high:.1f}°F)")
 
 last_wifi_status = None
 last_wifi_check = 0

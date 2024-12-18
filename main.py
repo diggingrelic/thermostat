@@ -7,8 +7,8 @@ import gc
 from umqtt.simple import MQTTClient
 from TempSensorADT7410 import TempSensorADT7410
 from mysecrets import SSID, PASSWORD, AIO_USERNAME, AIO_KEY
-from HeaterController import HeaterController
-from ThermostatController import ThermostatController
+#from HeaterController import HeaterController
+#from ThermostatController import ThermostatController
 from TimeManager import TimeManager
 
 # Debug flag for verbose logging
@@ -25,6 +25,7 @@ AIO_FEED_TEMP_DIFF = f"{AIO_USERNAME}/feeds/temp_diff"
 AIO_FEED_MIN_TIME_ON = f"{AIO_USERNAME}/feeds/min_time_on"
 AIO_FEED_HEATER_STATUS = f"{AIO_USERNAME}/feeds/heater_status"
 AIO_FEED_RUNTIME = f"{AIO_USERNAME}/feeds/runtime_mins"
+AIO_FEED_TIMER = f"{AIO_USERNAME}/feeds/timer"  # NEW: Timer feed
 
 # Define GPIO pad registers
 PADS_BANK0_BASE = 0x4001C000
@@ -67,6 +68,9 @@ time_manager = None  # Initialize time_manager as None
 i2c = machine.I2C(0, scl=machine.Pin(5), sda=machine.Pin(4), freq=100000)
 temp_sensor = TempSensorADT7410(i2c)
 
+timer_end_time = 0  # When timer should finish (0 = no timer)
+current_timer_hours = 0  # Current timer value for feed updates
+
 def log(message):
     if debug:
         print(message)
@@ -107,8 +111,8 @@ def blink_led(times, delay):
         led.off()
         time.sleep(delay)
 
-def mqtt_callback(topic, msg):
-    global setpoint, relay_state, temp_diff, cycle_delay, min_time_on, heater_status, total_runtime, time_manager
+def mqtt_callback(topic, msg, client):
+    global setpoint, relay_state, temp_diff, cycle_delay, min_time_on, heater_status, total_runtime, time_manager, timer_end_time, current_timer_hours
     topic_str = topic.decode() if isinstance(topic, bytes) else topic
     msg_str = msg.decode()
     
@@ -193,6 +197,30 @@ def mqtt_callback(topic, msg):
                 log(f"Runtime updated: {total_runtime} minutes")
         except ValueError:
             log("Invalid runtime value received")
+    elif topic_str == AIO_FEED_TIMER:
+        try:
+            if msg_str.startswith('R:'):  # Added: Skip our remaining time updates
+                return
+                
+            if msg_str.lower() in ('0', 'off'):
+                if timer_end_time > 0:
+                    timer_end_time = 0
+                    current_timer_hours = 0
+                    relay_state = False
+                    client.publish(AIO_FEED_RELAY, "OFF")
+                    log("Timer cancelled, relay commanded OFF")
+            else:
+                hours = float(msg_str)
+                if 1 <= hours <= 12:  # Between 1 and 12 hours
+                    timer_end_time = time.time() + (hours * 3600)  # Convert to seconds
+                    current_timer_hours = hours
+                    relay_state = True
+                    client.publish(AIO_FEED_RELAY, "ON")
+                    log(f"Timer set for {hours:.1f} hours, relay commanded ON")
+                else:
+                    log(f"Invalid timer duration: {hours} (must be between 1-12 hours)")
+        except ValueError:
+            log(f"Invalid timer format: {msg_str} (use hours between 1-12)")
 
 def get_valid_temperature():
     """Get valid temperature reading with retries"""
@@ -205,7 +233,7 @@ def get_valid_temperature():
 
 def get_initial_state(client, retries=3):
     """Fetch initial state with retries"""
-    global setpoint, temp_diff, cycle_delay, relay_state, min_time_on, total_runtime
+    global setpoint, temp_diff, cycle_delay, relay_state, min_time_on, total_runtime, timer_end_time, current_timer_hours
     
     for retry in range(retries):
         log("Fetching initial state...")
@@ -224,8 +252,9 @@ def get_initial_state(client, retries=3):
         time.sleep(0.1)
         client.publish(AIO_FEED_RUNTIME + "/get", "")
         time.sleep(0.1)
+        client.publish(AIO_FEED_TIMER + "/get", "")
+        time.sleep(0.1)
         
-        # Wait for responses with a 5-second timeout
         timeout = time.time() + 5
         while time.time() < timeout:
             try:
@@ -244,9 +273,11 @@ def get_initial_state(client, retries=3):
                     received_values.add('relay')
                 if isinstance(total_runtime, (int, float)):
                     received_values.add('runtime')
+                if isinstance(current_timer_hours, (int, float)):
+                    received_values.add('timer')
                 
                 # If we got all values, we're done
-                if len(received_values) >= 6:  # Updated count to 6
+                if len(received_values) >= 7:  # Updated count to 7
                     log(f"Received all initial values after {retry + 1} attempts")
                     return True
                     
@@ -256,7 +287,7 @@ def get_initial_state(client, retries=3):
             time.sleep(0.1)
         
         # Log what we're still waiting for
-        missing = {'setpoint', 'cycle_delay', 'temp_diff', 'min_time_on', 'relay', 'runtime'} - received_values
+        missing = {'setpoint', 'cycle_delay', 'temp_diff', 'min_time_on', 'relay', 'runtime', 'timer'} - received_values
         log(f"Attempt {retry + 1}: Still waiting for: {', '.join(missing)}")
         
         if retry < retries - 1:
@@ -289,8 +320,8 @@ def reconnect_with_backoff(client, attempts=5):
             try:
                 client.sock.close()  # Explicitly close the socket
                 client.disconnect()
-            except:
-                pass
+            except Exception as e:
+                log(f"Disconnect error: {e}")
             
             time.sleep(delay)
             gc.collect()
@@ -303,6 +334,7 @@ def reconnect_with_backoff(client, attempts=5):
             client.subscribe(AIO_FEED_CYCLE_DELAY)
             client.subscribe(AIO_FEED_TEMP_DIFF)
             client.subscribe(AIO_FEED_MIN_TIME_ON)
+            client.subscribe(AIO_FEED_TIMER)  # NEW: Subscribe to timer feed
             log("Reconnected and subscribed to feeds.")
             return client
             
@@ -346,7 +378,7 @@ def update_relay_state(temperature, client):
                 total_runtime += runtime
                 client.publish(AIO_FEED_RUNTIME, str(int(total_runtime)))
             client.publish(AIO_FEED_HEATER_STATUS, "0")
-            log(f"Relay turned OFF (minimum time elapsed)")
+            log("Relay turned OFF (minimum time elapsed)")
             return
         # If minimum time not met, stay on
         elif not relay_state and time_on < (min_time_on * 60):
@@ -420,13 +452,13 @@ last_logged_temp = None
 last_logged_bounds = None
 
 def main():
-    global time_manager, thermostat, temp_sensor, last_ping, last_logged_temp
+    global time_manager, thermostat, temp_sensor, last_ping, timer_end_time, current_timer_hours, relay_state
     
     if connect_to_wifi(SSID, PASSWORD):
         blink_led(5, 0.2)
 
         client = create_mqtt_client()
-        client.set_callback(mqtt_callback)
+        client.set_callback(lambda topic, msg: mqtt_callback(topic, msg, client))
         gc.collect()
         
         try:
@@ -440,6 +472,7 @@ def main():
             client.subscribe(AIO_FEED_TEMP_DIFF)
             client.subscribe(AIO_FEED_MIN_TIME_ON)
             client.subscribe(AIO_FEED_HEATER_STATUS)
+            client.subscribe(AIO_FEED_TIMER)  # Add this line
             
             time_manager = TimeManager(client, log)
             
@@ -458,6 +491,7 @@ def main():
         last_temp_update = time.time()
         last_ping = time.time()  # Keep ping monitoring
         last_logged_temp = None
+        last_timer_check = time.time()  # NEW: Initialize timer check
 
         try:
             while True:
@@ -497,6 +531,22 @@ def main():
                     log_wifi_status()
                     time.sleep(5)
                     gc.collect()
+
+                    # Timer check and update
+                    if timer_end_time > 0:
+                        if current_time >= timer_end_time:
+                            timer_end_time = 0
+                            current_timer_hours = 0
+                            relay_state = False
+                            client.publish(AIO_FEED_RELAY, "OFF")
+                            client.publish(AIO_FEED_TIMER, "0")  # Changed: Remove "R:" prefix for final 0
+                            log("Timer expired, relay commanded OFF")
+                        elif current_time - last_timer_check >= 60:  # Update every minute
+                            remaining_hours = (timer_end_time - current_time) / 3600
+                            if remaining_hours != current_timer_hours:
+                                current_timer_hours = remaining_hours
+                                client.publish(AIO_FEED_TIMER, f"R:{remaining_hours:.2f}")
+                            last_timer_check = current_time
 
                 except OSError as e:
                     log(f"MQTT Error: {e}")

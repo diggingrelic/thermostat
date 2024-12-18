@@ -116,6 +116,24 @@ def blink_led(times, delay):
         led.off()
         time.sleep(delay)
 
+def parse_runtime(runtime_str):
+    """Convert 'Xh Ym' format back to minutes"""
+    try:
+        if 'h' in runtime_str and 'm' in runtime_str:
+            parts = runtime_str.split()
+            hours = int(parts[0].rstrip('h'))
+            mins = int(parts[1].rstrip('m'))
+            return (hours * 60) + mins
+        elif 'h' in runtime_str:
+            hours = int(runtime_str.rstrip('h'))
+            return hours * 60
+        elif 'm' in runtime_str:
+            return int(runtime_str.rstrip('m'))
+        else:
+            return float(runtime_str)  # fallback for old numeric format
+    except (ValueError, IndexError):
+        return 0
+
 def mqtt_callback(topic, msg, client):
     global setpoint, relay_state, temp_diff, cycle_delay, min_time_on, heater_status, total_runtime, time_manager, timer_end_time, current_timer_hours
     topic_str = topic.decode() if isinstance(topic, bytes) else topic
@@ -202,10 +220,10 @@ def mqtt_callback(topic, msg, client):
             log("Invalid heater status value received")
     elif topic_str == AIO_FEED_RUNTIME:
         try:
-            new_runtime = float(msg_str)
+            new_runtime = parse_runtime(msg_str)
             if new_runtime != total_runtime:
                 total_runtime = new_runtime
-                log(f"Runtime updated: {total_runtime} minutes")
+                log(f"Runtime restored: {format_runtime(total_runtime)}")
         except ValueError:
             log("Invalid runtime value received")
     elif topic_str == AIO_FEED_TIMER:
@@ -339,13 +357,13 @@ def reconnect_with_backoff(client, attempts=5):
             # Properly clean up the old client
             try:
                 client.disconnect()
-            except:
+            except OSError:  # Socket errors or if sock is None
                 pass
                 
             try:
                 if client.sock:
                     client.sock.close()
-            except:
+            except (OSError, AttributeError):  # Socket errors or if sock is None
                 pass
             
             # Add a small delay to ensure socket cleanup
@@ -393,6 +411,32 @@ def reconnect_with_backoff(client, attempts=5):
     send_status(client, "ERROR: MQTT reconnection failed after all attempts")
     return None
 
+def format_runtime(minutes):
+    """Convert total minutes to 'X hours & Y min' format"""
+    hours = int(minutes // 60)
+    mins = int(minutes % 60)
+    if hours > 0:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+def update_runtime(client, force_update=False):
+    """Update total runtime. Call periodically and when heater turns off."""
+    global total_runtime, heater_start_time
+    
+    if current_relay_state and heater_start_time > 0:
+        # Calculate current session runtime
+        current_time = time.time()
+        current_session = (current_time - heater_start_time) / 60  # Convert to minutes
+        new_total = total_runtime + current_session
+        
+        # Only update if significant change (> 1 minute) or forced
+        if force_update or int(new_total) > int(total_runtime):
+            total_runtime = new_total
+            formatted_time = format_runtime(total_runtime)
+            client.publish(AIO_FEED_RUNTIME, formatted_time)
+            if debug:
+                log(f"Runtime updated: {formatted_time}")
+
 def update_relay_state(temperature, client):
     global current_relay_state, last_relay_change, last_logged_bounds
     global heater_start_time, total_runtime, heater_status
@@ -413,16 +457,13 @@ def update_relay_state(temperature, client):
         time_on = current_time - heater_start_time
         # If commanded OFF and minimum time met, turn off
         if not relay_state and time_on >= (min_time_on * 60):
+            update_runtime(client, force_update=True)  # Update before turning off
             current_relay_state = False
-            last_relay_change = current_time  # Start cycle delay timer
+            last_relay_change = current_time
             relay_pin.off()
             led.off()
             heater_status = 0
-            # Calculate runtime for this session
-            if heater_start_time > 0:
-                runtime = (current_time - heater_start_time) / 60
-                total_runtime += runtime
-                client.publish(AIO_FEED_RUNTIME, str(int(total_runtime)))
+            heater_start_time = 0  # Reset start time
             client.publish(AIO_FEED_HEATER_STATUS, "0")
             log("Relay turned OFF (minimum time elapsed)")
             return
@@ -446,26 +487,25 @@ def update_relay_state(temperature, client):
     )
 
     if desired_relay_state != current_relay_state:
+        if current_relay_state:
+            update_runtime(client, force_update=True)  # Update before state change
+        
         current_relay_state = desired_relay_state
         last_relay_change = current_time
         
         if current_relay_state:
             relay_pin.on()
             led.on()
-            heater_start_time = current_time  # Track when relay turns on
-            heater_status = 1  # Update heater status
-            client.publish(AIO_FEED_HEATER_STATUS, "1")  # Publish status change
+            heater_start_time = current_time
+            heater_status = 1
+            client.publish(AIO_FEED_HEATER_STATUS, "1")
             log(f"Relay turned ON (Temperature {temperature:.1f}°F below low limit {temp_low:.1f}°F)")
         else:
             relay_pin.off()
             led.off()
-            heater_status = 0  # Update heater status
-            # Calculate runtime for this session
-            if heater_start_time > 0:
-                runtime = (current_time - heater_start_time) / 60  # Convert to minutes
-                total_runtime += runtime
-                client.publish(AIO_FEED_RUNTIME, str(int(total_runtime)))
-            client.publish(AIO_FEED_HEATER_STATUS, "0")  # Publish status change
+            heater_status = 0
+            heater_start_time = 0  # Reset start time
+            client.publish(AIO_FEED_HEATER_STATUS, "0")
             log(f"Relay turned OFF (Temperature {temperature:.1f}°F above high limit {temp_high:.1f}°F)")
 
 last_wifi_status = None
@@ -541,7 +581,6 @@ def send_status(client, message, force=False):
                 log(f"Status update: {message}")
         except Exception as e:
             log(f"Failed to send status: {e}")
-            # Don't try to send more status messages about the failure
 
 def main():
     global time_manager, thermostat, temp_sensor, last_ping, timer_end_time, current_timer_hours, relay_state
@@ -608,6 +647,7 @@ def main():
         last_ping = time.time()  # Keep ping monitoring
         last_logged_temp = None
         last_timer_check = time.time()  # NEW: Initialize timer check
+        last_runtime_update = 0  # Track last runtime update
 
         try:
             while True:
@@ -667,6 +707,11 @@ def main():
                                 client.publish(AIO_FEED_TIMER, f"R:{remaining_hours:.2f}")
                             last_timer_check = current_time
 
+                    # Periodic runtime update (every minute)
+                    if current_time - last_runtime_update >= 60:
+                        update_runtime(client)
+                        last_runtime_update = current_time
+
                 except OSError as e:
                     error_msg = f"ERROR: MQTT connection lost - {str(e)}"
                     send_status(client, error_msg, force=True)
@@ -678,13 +723,13 @@ def main():
                     # Try to clean up the old client
                     try:
                         client.disconnect()
-                    except:
+                    except OSError:  # Specific to socket/network errors
                         pass
                         
                     try:
                         if client.sock:
                             client.sock.close()
-                    except:
+                    except (OSError, AttributeError):  # Socket errors or if sock is None
                         pass
                     
                     gc.collect()

@@ -2,3 +2,4 @@
 micropython-env/*
 umqtt/simple.py
 .DS_Store
+simple2.py

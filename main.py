@@ -8,6 +8,7 @@ from umqtt.simple2 import MQTTClient
 from TempSensorADT7410 import TempSensorADT7410
 from mysecrets import SSID, PASSWORD, AIO_USERNAME, AIO_KEY
 from TimeManager import TimeManager
+from umqtt.simple2 import MQTTException
 
 # Debug flag for verbose logging
 debug = True
@@ -107,6 +108,11 @@ last_wifi_check = 0
 last_ping = 0
 ping_interval = 30  # seconds
 
+# Initialize MQTT timing variables
+last_mqtt_attempt = time.time()
+timer_end_time = 0
+current_timer_hours = 0
+
 def log(message):
     if debug:
         print(message)
@@ -157,7 +163,7 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
         retained: Boolean indicating if this was a retained message
         duplicate: Boolean indicating if this was a duplicate delivery
     """
-    global client, setpoint, relay_state, temp_diff, cycle_delay, min_time_on, heater_status, current_timer_hours
+    global client, setpoint, relay_state, temp_diff, cycle_delay, min_time_on, heater_status, current_timer_hours, timer_end_time
     topic_str = topic.decode() if isinstance(topic, bytes) else topic
     msg_str = msg.decode()
     
@@ -366,23 +372,20 @@ def reconnect_with_backoff(client, attempts=5):
     for attempt in range(attempts):
         try:
             log(f"Reconnecting to MQTT broker, attempt {attempt + 1}...")
-            
             # Properly clean up the old client
             try:
                 client.disconnect()
-            except:
-                pass
+            except Exception as e:
+                log(f"Error during disconnect: {e}")
             
-            time.sleep(1)  # Ensure socket cleanup
+            time.sleep(1)
             gc.collect()
 
             client = create_mqtt_client()
             client.set_callback(mqtt_callback)
             client.connect()
-            
-            # Add a small delay before subscribing
             time.sleep(1)
-            
+
             # Subscribe to all feeds
             feeds = [
                 AIO_FEED_RELAY,
@@ -390,23 +393,19 @@ def reconnect_with_backoff(client, attempts=5):
                 AIO_FEED_CYCLE_DELAY,
                 AIO_FEED_TEMP_DIFF,
                 AIO_FEED_MIN_TIME_ON,
-                AIO_FEED_HEATER_STATUS,
                 AIO_FEED_TIMER
             ]
             
             for feed in feeds:
                 client.subscribe(feed)
-                time.sleep(0.1)
                 
             log("Reconnected and subscribed to feeds.")
-            time.sleep(5)
-            set_mqtt_connected(True)
             send_status(client, "OK RECONNECT: MQTT restored")
             return client
 
         except Exception as e:
-            set_mqtt_connected(False)
             log(f"Reconnection attempt {attempt + 1} failed: {e}")
+            send_status(client, f"ERROR: MQTT reconnect failed - attempt {attempt + 1}")
             delay *= 2  # Exponential backoff
             if attempt < attempts - 1:
                 time.sleep(delay)
@@ -699,53 +698,35 @@ def main():
 
         client = create_mqtt_client()
         client.set_callback(mqtt_callback)
-        gc.collect()
         
         try:
             log("Attempting MQTT connection...")
-            try:
-                client.connect()
-                set_mqtt_connected(True)
-                log("MQTT connected successfully")
-            except OSError as e:
-                set_mqtt_connected(False)
-                error_code = str(e)
-                error_msg = {
-                    "-2": "Network connection failed",
-                    "-1": "Connection refused",
-                    "1": "Connection refused - incorrect protocol version",
-                    "2": "Connection refused - invalid client identifier",
-                    "3": "Connection refused - server unavailable",
-                    "4": "Connection refused - bad username or password",
-                    "5": "Connection refused - not authorised"
-                }.get(error_code, f"Unknown error ({error_code})")
-                
-                send_status(client, f"ERROR: MQTT connection - {error_msg}")
-                log(f"Failed to connect to MQTT broker: {error_msg}")
-                
-                # Try to reconnect
-                client = reconnect_with_backoff(client)
-                if not client:
-                    return
+            client.connect()
+            set_mqtt_connected(True)
+            log("MQTT connected successfully")
             
-            # Subscribe to all control feeds
-            client.subscribe(AIO_FEED_RELAY)
-            client.subscribe(AIO_FEED_SETPOINT)
-            client.subscribe(AIO_FEED_CYCLE_DELAY)
-            client.subscribe(AIO_FEED_TEMP_DIFF)
-            client.subscribe(AIO_FEED_MIN_TIME_ON)
-            client.subscribe(AIO_FEED_HEATER_STATUS)
-            client.subscribe(AIO_FEED_TIMER)
+            # Subscribe to feeds
+            feeds = [
+                AIO_FEED_RELAY,
+                AIO_FEED_SETPOINT,
+                AIO_FEED_CYCLE_DELAY,
+                AIO_FEED_TEMP_DIFF,
+                AIO_FEED_MIN_TIME_ON,
+                AIO_FEED_HEATER_STATUS,
+                AIO_FEED_TIMER
+            ]
+            
+            for feed in feeds:
+                client.subscribe(feed)
+                time.sleep(0.1)
             
             time_manager = TimeManager(client, log)
             
-            # Wait for initial state before proceeding
             if not get_initial_state(client):
                 send_status(client, "ERROR: Failed to get initial state")
                 log("Failed to get initial state, restarting...")
                 return
             
-            # Single boot status after everything is ready
             send_status(client, "OK BOOT: System ready", force=True)
             log("Initial state received, starting temperature monitoring...")
             
@@ -773,7 +754,21 @@ def main():
                         time.sleep(1)  # Don't spin if MQTT is down
                         continue
                         
-                    client.check_msg()  # Check for incoming messages
+                    try:
+                        client.check_msg()
+                    except Exception as e:
+                        if isinstance(e, MQTTException) and e.args[0] == 1:
+                            log("MQTT connection closed by host")
+                            set_mqtt_connected(False)
+                            client = reconnect_with_backoff(client)
+                            if not client:
+                                return
+                        else:
+                            log(f"Main loop error: {e}")
+                            set_mqtt_connected(False)
+                            time.sleep(1)
+                            continue
+
                     current_time = time.time()
                     
                     # Keep connection health monitoring

@@ -2,61 +2,14 @@
 import network
 import time
 import machine
-from machine import mem32
 import gc
 from umqtt.simple2 import MQTTClient
+from umqtt.simple2 import MQTTException
+import config.py as config
 from TempSensorADT7410 import TempSensorADT7410
 from mysecrets import SSID, PASSWORD, AIO_USERNAME, AIO_KEY
 from TimeManager import TimeManager
-from umqtt.simple2 import MQTTException
-
-# Debug flag for verbose logging
-debug = True
-
-# MQTT details
-AIO_SERVER = "io.adafruit.com"
-AIO_PORT = 1883
-AIO_FEED_RELAY = f"{AIO_USERNAME}/feeds/relay"
-AIO_FEED_SETPOINT = f"{AIO_USERNAME}/feeds/setpoint"
-AIO_FEED_TEMP = f"{AIO_USERNAME}/feeds/temp"
-AIO_FEED_CYCLE_DELAY = f"{AIO_USERNAME}/feeds/cycle_delay"
-AIO_FEED_TEMP_DIFF = f"{AIO_USERNAME}/feeds/temp_diff"
-AIO_FEED_MIN_TIME_ON = f"{AIO_USERNAME}/feeds/min_time_on"
-AIO_FEED_HEATER_STATUS = f"{AIO_USERNAME}/feeds/heater_status"
-AIO_FEED_TIMER = f"{AIO_USERNAME}/feeds/timer"  # NEW: Timer feed
-AIO_FEED_STATUS = f"{AIO_USERNAME}/feeds/status"
-AIO_FEED_DAILY_COST = f"{AIO_USERNAME}/feeds/daily_cost"
-HEATER_COST_PER_HOUR = 0.90  # Cost in dollars per hour
-
-# Define GPIO pad registers
-PADS_BANK0_BASE = 0x4001C000
-PAD_GPIO = PADS_BANK0_BASE + 0x04
-PAD_GPIO_MPY = 4
-PAD_DRIVE_BITS = 4
-
-# MQTT States
-MQTT_STATE_DISCONNECTED = 0
-MQTT_STATE_CONNECTING = 1
-MQTT_STATE_CONNECTED = 2
-
-# WiFi States
-WIFI_STATE_DISCONNECTED = 0
-WIFI_STATE_CONNECTING = 1
-WIFI_STATE_CONNECTED = 2
-
-def set_pin_drive_strength(pin, mA):
-    """Sets the drive strength of a GPIO pin."""
-    addr = PAD_GPIO + PAD_GPIO_MPY * pin
-    mem32[addr] &= 0xFFFFFFFF ^ (0b11 << PAD_DRIVE_BITS)
-
-    if mA <= 2:
-        mem32[addr] |= 0b00 << PAD_DRIVE_BITS
-    elif mA <= 4:
-        mem32[addr] |= 0b01 << PAD_DRIVE_BITS
-    elif mA <= 8:
-        mem32[addr] |= 0b10 << PAD_DRIVE_BITS
-    else:
-        mem32[addr] |= 0b11 << PAD_DRIVE_BITS
+from thermo.PinDriveStrength import set_pin_drive_strength
 
 # Initialize controllers
 led = machine.Pin("LED", machine.Pin.OUT)
@@ -86,8 +39,8 @@ last_logged_temp = None  # Track last logged temperature
 last_logged_bounds = None  # Track last logged temperature bounds
 
 # Initialize connection state
-mqtt_state = MQTT_STATE_DISCONNECTED
-wifi_state = WIFI_STATE_DISCONNECTED
+mqtt_state = config.MQTT_STATE_DISCONNECTED
+wifi_state = config.WIFI_STATE_DISCONNECTED
 
 # Initialize time management
 time_manager = None  # Initialize time_manager as None
@@ -114,7 +67,7 @@ timer_end_time = 0
 current_timer_hours = 0
 
 def log(message):
-    if debug:
+    if config.debug:
         print(message)
 
 def connect_to_wifi(ssid, password):
@@ -172,7 +125,7 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
     if topic_str == "time/seconds":
         if time_manager:
             time_manager.handle_time_message(msg)
-    elif topic_str == AIO_FEED_RELAY:
+    elif topic_str == config.AIO_FEED_RELAY:
         new_relay_state = msg_str.lower() == "on"
         if new_relay_state != relay_state:
             relay_state = new_relay_state
@@ -180,12 +133,12 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
             if not relay_state and timer_end_time > 0:
                 timer_end_time = 0
                 current_timer_hours = 0
-                client.publish(AIO_FEED_TIMER, "0")  # Update timer feed
+                client.publish(config.AIO_FEED_TIMER, "0")  # Update timer feed
                 log("Timer cancelled due to relay OFF command")
             log(f"Relay command received: {relay_state} (Actual state: {current_relay_state}, min time holding: {current_relay_state and not relay_state})")
         else:
             log(f"Relay command unchanged: command={relay_state}, actual={current_relay_state}")
-    elif topic_str == AIO_FEED_SETPOINT:
+    elif topic_str == config.AIO_FEED_SETPOINT:
         try:
             new_setpoint = float(msg_str)
             if new_setpoint != setpoint:
@@ -196,7 +149,7 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
                 log(f"Setpoint unchanged: current={setpoint}, received={new_setpoint}")
         except ValueError:
             log("Invalid setpoint value received")
-    elif topic_str == AIO_FEED_CYCLE_DELAY:
+    elif topic_str == config.AIO_FEED_CYCLE_DELAY:
         try:
             new_cycle_delay = float(msg_str)
             if new_cycle_delay != cycle_delay:
@@ -210,7 +163,7 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
                 log(f"Cycle delay unchanged: current={cycle_delay}, received={new_cycle_delay}")
         except ValueError:
             log("Invalid cycle delay value received")
-    elif topic_str == AIO_FEED_TEMP_DIFF:
+    elif topic_str == config.AIO_FEED_TEMP_DIFF:
         try:
             new_temp_diff = float(msg_str)
             if new_temp_diff != temp_diff:
@@ -224,7 +177,7 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
                 log(f"Temperature differential unchanged: current={temp_diff}, received={new_temp_diff}")
         except ValueError:
             log("Invalid temperature differential value received")
-    elif topic_str == AIO_FEED_MIN_TIME_ON:
+    elif topic_str == config.AIO_FEED_MIN_TIME_ON:
         try:
             new_min_time = float(msg_str)
             if new_min_time != min_time_on:
@@ -238,7 +191,7 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
                 log(f"Minimum on-time unchanged: current={min_time_on}, received={new_min_time}")
         except ValueError:
             log("Invalid minimum on-time value received")
-    elif topic_str == AIO_FEED_HEATER_STATUS:
+    elif topic_str == config.AIO_FEED_HEATER_STATUS:
         try:
             new_status = int(msg_str)
             if new_status != heater_status:
@@ -246,7 +199,7 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
                 log(f"Heater status updated: {heater_status}")
         except ValueError:
             log("Invalid heater status value received")
-    elif topic_str == AIO_FEED_TIMER:
+    elif topic_str == config.AIO_FEED_TIMER:
         try:
             if msg_str.startswith('R:'):  # Handle remaining time updates
                 if timer_end_time == 0:  # Only process if we're initializing
@@ -263,7 +216,7 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
                     timer_end_time = 0
                     current_timer_hours = 0
                     relay_state = False
-                    client.publish(AIO_FEED_RELAY, "OFF")
+                    client.publish(config.AIO_FEED_RELAY, "OFF")
                     log("Timer cancelled, relay commanded OFF")
             else:
                 hours = float(msg_str)
@@ -271,7 +224,7 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
                     timer_end_time = time.time() + (hours * 3600)  # Convert to seconds
                     current_timer_hours = hours
                     relay_state = True
-                    client.publish(AIO_FEED_RELAY, "ON")
+                    client.publish(config.AIO_FEED_RELAY, "ON")
                     log(f"Timer set for {hours:.1f} hours, relay commanded ON")
                 else:
                     log(f"Invalid timer duration: {hours} (must be between 1-12 hours)")
@@ -296,17 +249,17 @@ def get_initial_state(client, retries=3):
         received_values = set()
         
         # Request values
-        client.publish(AIO_FEED_RELAY + "/get", "")
+        client.publish(config.AIO_FEED_RELAY + "/get", "")
         time.sleep(0.5)
-        client.publish(AIO_FEED_SETPOINT + "/get", "")
+        client.publish(config.AIO_FEED_SETPOINT + "/get", "")
         time.sleep(0.1)
-        client.publish(AIO_FEED_CYCLE_DELAY + "/get", "")
+        client.publish(config.AIO_FEED_CYCLE_DELAY + "/get", "")
         time.sleep(0.1)
-        client.publish(AIO_FEED_TEMP_DIFF + "/get", "")
+        client.publish(config.AIO_FEED_TEMP_DIFF + "/get", "")
         time.sleep(0.1)
-        client.publish(AIO_FEED_MIN_TIME_ON + "/get", "")
+        client.publish(config.AIO_FEED_MIN_TIME_ON + "/get", "")
         time.sleep(0.1)
-        client.publish(AIO_FEED_TIMER + "/get", "")
+        client.publish(config.AIO_FEED_TIMER + "/get", "")
         time.sleep(0.1)
         
         timeout = time.time() + 5
@@ -356,8 +309,8 @@ def create_mqtt_client():
     global client
     client = MQTTClient(
         client_id="pico",
-        server=AIO_SERVER,
-        port=AIO_PORT,
+        server=config.AIO_SERVER,
+        port=config.AIO_PORT,
         user=AIO_USERNAME,
         password=AIO_KEY,
         keepalive=MQTT_KEEPALIVE,
@@ -388,12 +341,12 @@ def reconnect_with_backoff(client, attempts=5):
 
             # Subscribe to all feeds
             feeds = [
-                AIO_FEED_RELAY,
-                AIO_FEED_SETPOINT,
-                AIO_FEED_CYCLE_DELAY,
-                AIO_FEED_TEMP_DIFF,
-                AIO_FEED_MIN_TIME_ON,
-                AIO_FEED_TIMER
+                config.AIO_FEED_RELAY,
+                config.AIO_FEED_SETPOINT,
+                config.AIO_FEED_CYCLE_DELAY,
+                config.AIO_FEED_TEMP_DIFF,
+                config.AIO_FEED_MIN_TIME_ON,
+                config.AIO_FEED_TIMER
             ]
             
             for feed in feeds:
@@ -445,7 +398,7 @@ def update_runtime(client, force_update=False):
                 send_status(client, f"OK RUNTIME: {format_runtime(daily_runtime)}")
                 last_runtime_status = current_time
             
-            if debug:
+            if config.debug:
                 log(f"Runtime updated: {format_runtime(daily_runtime)}")
 
 def update_relay_state(temperature, client):
@@ -477,7 +430,7 @@ def update_relay_state(temperature, client):
             heater_start_time = 0  # Reset start time
             last_runtime_update = 0  # Reset runtime update tracker
             last_runtime_status = 0  # Reset runtime status tracker
-            client.publish(AIO_FEED_HEATER_STATUS, "0")
+            client.publish(config.AIO_FEED_HEATER_STATUS, "0")
             log("Relay turned OFF (minimum time elapsed)")
             return
         # If minimum time not met, stay on
@@ -511,7 +464,7 @@ def update_relay_state(temperature, client):
             led.on()
             heater_start_time = current_time
             heater_status = 1
-            client.publish(AIO_FEED_HEATER_STATUS, "1")
+            client.publish(config.AIO_FEED_HEATER_STATUS, "1")
             log(f"Relay turned ON (Temperature {temperature:.1f}°F below low limit {temp_low:.1f}°F)")
         else:
             relay_pin.off()
@@ -520,7 +473,7 @@ def update_relay_state(temperature, client):
             heater_start_time = 0  # Reset start time
             last_runtime_update = 0  # Reset runtime update tracker
             last_runtime_status = 0  # Reset runtime status tracker
-            client.publish(AIO_FEED_HEATER_STATUS, "0")
+            client.publish(config.AIO_FEED_HEATER_STATUS, "0")
             log(f"Relay turned OFF (Temperature {temperature:.1f}°F above high limit {temp_high:.1f}°F)")
 
 def log_wifi_status(client):
@@ -583,10 +536,10 @@ def send_status(client, message, force=False):
         (message.startswith("OK") and current_time - last_status_update >= status_update_interval)):
         
         try:
-            client.publish(AIO_FEED_STATUS, message[:128])  # Limit to 128 chars
+            client.publish(config.AIO_FEED_STATUS, message[:128])  # Limit to 128 chars
             last_status_message = message
             last_status_update = current_time
-            if debug:
+            if config.debug:
                 log(f"Status update: {message}")
         except Exception as e:
             log(f"Failed to send status: {e}")
@@ -600,14 +553,14 @@ def check_wifi_connection():
     
     wlan = network.WLAN(network.STA_IF)
     if not wlan.isconnected():
-        if wifi_state != WIFI_STATE_DISCONNECTED:
-            wifi_state = WIFI_STATE_DISCONNECTED
+        if wifi_state != config.WIFI_STATE_DISCONNECTED:
+            wifi_state = config.WIFI_STATE_DISCONNECTED
             log("WiFi disconnected")
             
         # Only attempt reconnect after delay
         if current_time - last_wifi_attempt >= WIFI_RETRY_DELAY:
             last_wifi_attempt = current_time
-            wifi_state = WIFI_STATE_CONNECTING
+            wifi_state = config.WIFI_STATE_CONNECTING
             log("Attempting WiFi connection...")
             
             wlan.active(False)
@@ -618,7 +571,7 @@ def check_wifi_connection():
             # Wait briefly for connection
             for _ in range(10):
                 if wlan.isconnected():
-                    wifi_state = WIFI_STATE_CONNECTED
+                    wifi_state = config.WIFI_STATE_CONNECTED
                     log(f"WiFi connected, IP: {wlan.ifconfig()[0]}")
                     return True
                 time.sleep(1)
@@ -627,8 +580,8 @@ def check_wifi_connection():
             return False
             
     else:
-        if wifi_state != WIFI_STATE_CONNECTED:
-            wifi_state = WIFI_STATE_CONNECTED
+        if wifi_state != config.WIFI_STATE_CONNECTED:
+            wifi_state = config.WIFI_STATE_CONNECTED
             log(f"WiFi connected, IP: {wlan.ifconfig()[0]}")
         return True
 
@@ -639,25 +592,25 @@ def handle_mqtt_connection(client):
     MQTT_RETRY_DELAY = 30
     
     # Only attempt reconnection if WiFi is available
-    if wifi_state != WIFI_STATE_CONNECTED:
-        mqtt_state = MQTT_STATE_DISCONNECTED
+    if wifi_state != config.WIFI_STATE_CONNECTED:
+        mqtt_state = config.MQTT_STATE_DISCONNECTED
         return client
         
-    if mqtt_state == MQTT_STATE_DISCONNECTED:
+    if mqtt_state == config.MQTT_STATE_DISCONNECTED:
         if current_time - last_mqtt_attempt >= MQTT_RETRY_DELAY:
             last_mqtt_attempt = current_time
-            mqtt_state = MQTT_STATE_CONNECTING
+            mqtt_state = config.MQTT_STATE_CONNECTING
             client = reconnect_with_backoff(client)
             if client:
-                mqtt_state = MQTT_STATE_CONNECTED
+                mqtt_state = config.MQTT_STATE_CONNECTED
                 
     return client
 
 def set_mqtt_connected(success=True):
     """Set MQTT state and log the change"""
     global mqtt_state
-    mqtt_state = MQTT_STATE_CONNECTED if success else MQTT_STATE_DISCONNECTED
-    if debug:
+    mqtt_state = config.MQTT_STATE_CONNECTED if success else config.MQTT_STATE_DISCONNECTED
+    if config.debug:
         log(f"MQTT state changed to: {'CONNECTED' if success else 'DISCONNECTED'}")
 
 def update_daily_cost(client, force=False):
@@ -671,10 +624,10 @@ def update_daily_cost(client, force=False):
         # Only post once per day
         if last_daily_post != current_time[7]:  # current_time[7] is day of year
             # Convert runtime from minutes to hours and calculate cost
-            daily_cost = (daily_runtime / 60) * HEATER_COST_PER_HOUR
+            daily_cost = (daily_runtime / 60) * config.HEATER_COST_PER_HOUR
             
             try:
-                client.publish(AIO_FEED_DAILY_COST, f"{daily_cost:.2f}")
+                client.publish(config.AIO_FEED_DAILY_COST, f"{daily_cost:.2f}")
                 log(f"Daily cost posted: ${daily_cost:.2f} ({daily_runtime} minutes)")
                 send_status(client, f"OK DAILY: Cost=${daily_cost:.2f} Runtime={format_runtime(daily_runtime)}")
                 
@@ -707,13 +660,13 @@ def main():
             
             # Subscribe to feeds
             feeds = [
-                AIO_FEED_RELAY,
-                AIO_FEED_SETPOINT,
-                AIO_FEED_CYCLE_DELAY,
-                AIO_FEED_TEMP_DIFF,
-                AIO_FEED_MIN_TIME_ON,
-                AIO_FEED_HEATER_STATUS,
-                AIO_FEED_TIMER
+                config.AIO_FEED_RELAY,
+                config.AIO_FEED_SETPOINT,
+                config.AIO_FEED_CYCLE_DELAY,
+                config.AIO_FEED_TEMP_DIFF,
+                config.AIO_FEED_MIN_TIME_ON,
+                config.AIO_FEED_HEATER_STATUS,
+                config.AIO_FEED_TIMER
             ]
             
             for feed in feeds:
@@ -750,7 +703,7 @@ def main():
                         
                     # Handle MQTT connection state
                     client = handle_mqtt_connection(client)
-                    if not client or mqtt_state != MQTT_STATE_CONNECTED:
+                    if not client or mqtt_state != config.MQTT_STATE_CONNECTED:
                         time.sleep(1)  # Don't spin if MQTT is down
                         continue
                         
@@ -792,7 +745,7 @@ def main():
                             
                         # Always publish every 60 seconds (no log)
                         if current_time - last_temp_update >= 60:
-                            client.publish(AIO_FEED_TEMP, f"{temperature:.2f}")
+                            client.publish(config.AIO_FEED_TEMP, f"{temperature:.2f}")
                             last_temp_update = current_time
                             
                         update_relay_state(temperature, client)
@@ -817,14 +770,14 @@ def main():
                             timer_end_time = 0
                             current_timer_hours = 0
                             relay_state = False
-                            client.publish(AIO_FEED_RELAY, "OFF")
-                            client.publish(AIO_FEED_TIMER, "0")
+                            client.publish(config.AIO_FEED_RELAY, "OFF")
+                            client.publish(config.AIO_FEED_TIMER, "0")
                             log("Timer expired, relay commanded OFF")
                         elif current_time - last_timer_check >= 60:  # Update every minute
                             remaining_hours = (timer_end_time - current_time) / 3600
                             if remaining_hours != current_timer_hours:
                                 current_timer_hours = remaining_hours
-                                client.publish(AIO_FEED_TIMER, f"R:{remaining_hours:.2f}")
+                                client.publish(config.AIO_FEED_TIMER, f"R:{remaining_hours:.2f}")
                             last_timer_check = current_time
 
                     # Periodic runtime update (every minute)

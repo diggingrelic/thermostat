@@ -2,20 +2,20 @@
 import time
 import machine
 import gc
-from umqtt.simple2 import MQTTException
+#from umqtt.simple2 import MQTTException
 import config
 from thermo.TimeManager import TimeManager
 from thermo.PinDriveStrength import set_pin_drive_strength
-from Log import log
-from MQTT import get_state,send_status, set_mqtt_connected, handle_mqtt_connection, reconnect_with_backoff, create_mqtt_client, mqtt_callback
-from WiFi import WiFi
+from thermo.Log import log
+from thermo.ThermoState import get_state, update_runtime, format_runtime
+from thermo.MQTT import send_status, set_mqtt_connected, handle_mqtt_connection, create_mqtt_client, callback_wrapper
+from thermo.WiFi import WiFi
 from thermo.RelayControl import RelayControl
 from thermo.Temperature import Temperature
-# Initialize watchdog with 8 second timeout
-wdt = machine.WDT(timeout=8000)
 
-# Check reset cause
-if machine.reset_cause() == machine.WATCHDOG_RESET:
+# Check reset cause (using available constants)
+reset_cause = machine.reset_cause()
+if reset_cause == 3:  # 3 is typically WDT reset
     log("Watchdog reset occurred")
 else:
     log("Normal startup")
@@ -24,9 +24,6 @@ else:
 led = machine.Pin("LED", machine.Pin.OUT)
 relay_pin = machine.Pin(14, machine.Pin.OUT)
 set_pin_drive_strength(14, 12)
-
-timer_end_time = 0  # When timer should finish (0 = no timer)
-current_timer_hours = 0  # Current timer value for feed updates
 
 # Initialize runtime tracking
 heater_start_time = 0  # Track when heater turns on
@@ -38,19 +35,35 @@ last_status_message = ""  # Track last message to prevent duplicates
 last_logged_temp = None  # Track last logged temperature
 last_logged_bounds = None  # Track last logged temperature bounds
 
-# Initialize connection state
-wifi_state = config.WIFI_STATE_DISCONNECTED
-
-ping_interval = 30
-mqtt_state = config.MQTT_STATE_DISCONNECTED
+state = get_state()
+state.relay_pin = relay_pin
+state.led = led
+state.wifi_state = config.WIFI_STATE_DISCONNECTED
+state.mqtt_state = config.MQTT_STATE_DISCONNECTED
+state.timer_end_time = 0  # When timer should finish (0 = no timer)
+state.current_timer_hours = 0  # Current timer value for feed updates
 
 # Initialize time management
 time_manager = None  # Initialize time_manager as None
 
-temperatures = Temperature()
+# Initialize with no watchdog
+wdt = None
+wifi = WiFi(wdt, watchdog_enabled=False)
 
-wifi = WiFi()
-relay_control = RelayControl(relay_pin, led)
+# Try initial connection without watchdog
+if not wifi.connect_to_wifi():
+    log("Initial WiFi connection failed, restarting...")
+    time.sleep(1)
+    machine.reset()
+else:
+    state.wifi_state = config.WIFI_STATE_CONNECTED
+
+# Now enable watchdog after successful connection
+#wdt = machine.WDT(timeout=8000)
+#wifi.wdt = wdt  # Update WiFi instance with new WDT
+#wifi.watchdog_enabled = True
+
+relay_control = RelayControl()
 
 last_status_update = 0
 last_runtime_status = 0  # Track last runtime status message
@@ -69,9 +82,6 @@ def blink_led(times, delay):
         time.sleep(delay)
 
 def get_initial_state(client, retries=3):
-    """Fetch initial state with retries"""
-    state = get_state()  # Get reference to the shared state
-
     for retry in range(retries):
         log("Fetching initial state...")
         received_values = set()
@@ -94,6 +104,7 @@ def get_initial_state(client, retries=3):
         while time.time() < timeout:
             try:
                 client.check_msg()
+                feed_watchdog()
                 
                 # Mark values as received when we get any response
                 if isinstance(state.setpoint, float):
@@ -128,41 +139,6 @@ def get_initial_state(client, retries=3):
     
     return False
 
-def format_runtime(minutes):
-    """Convert total minutes to 'X hours & Y min' format"""
-    hours = int(minutes // 60)
-    mins = int(minutes % 60)
-    if hours > 0:
-        return f"{hours}h {mins}m"
-    return f"{mins}m"
-
-def update_runtime(client, force_update=False):
-    """Update runtime. Call periodically and when heater turns off."""
-    global daily_runtime, heater_start_time, last_runtime_update, last_runtime_status
-    
-    if relay_control.current_relay_state and heater_start_time > 0:
-        current_time = time.time()
-        
-        # If this is our first update for this session
-        if last_runtime_update == 0:
-            last_runtime_update = heater_start_time
-            
-        # Calculate minutes since last update
-        minutes_since_update = (current_time - last_runtime_update) / 60
-        
-        # Only update if significant change (> 1 minute) or forced
-        if force_update or minutes_since_update >= 1:
-            daily_runtime += minutes_since_update
-            last_runtime_update = current_time  # Remember when we did this update
-            
-            # Send runtime status every 15 minutes
-            if current_time - last_runtime_status >= 900:  # 15 minutes = 900 seconds
-                send_status(client, f"OK RUNTIME: {format_runtime(daily_runtime)}")
-                last_runtime_status = current_time
-            
-            if config.debug:
-                log(f"Runtime updated: {format_runtime(daily_runtime)}")
-
 def update_daily_cost(client, force=False):
     """Update daily cost at 10:45 PM or when forced"""
     global daily_runtime, last_daily_post
@@ -192,18 +168,20 @@ def update_daily_cost(client, force=False):
                 log(f"Failed to post daily cost: {e}")
                 send_status(client, f"ERROR: Failed to post daily cost - {str(e)}")
 
+def feed_watchdog():
+    """Safe watchdog feed with enable/disable flag"""
+    #if wifi.watchdog_enabled and wifi.wdt:
+    #    wifi.wdt.feed()
+
 def main():
-    machine.wdt.feed()
-    state = get_state()  # Get reference to the shared state
+    #feed_watchdog()
 
-    if wifi.connect_to_wifi():
-        wifi_state = config.WIFI_STATE_CONNECTED
-        blink_led(5, 0.2)
-        machine.wdt.feed()
-
+    if state.wifi_state == config.WIFI_STATE_CONNECTED:
+        #feed_watchdog()
         client = create_mqtt_client()
-        client.set_callback(mqtt_callback)
-        
+        client.set_callback(callback_wrapper)
+        state.client = client
+
         try:
             log("Attempting MQTT connection...")
             client.connect()
@@ -213,7 +191,7 @@ def main():
             for feed in config.SUBSCRIBE_FEEDS:
                 client.subscribe(feed)
                 time.sleep(1)
-                machine.wdt.feed()
+                #feed_watchdog()
             
             time_manager = TimeManager(client, log) #?????
             
@@ -230,54 +208,41 @@ def main():
             return
 
         # Initialize all tracking variables
-        last_temp_update = time.time()
+        last_temp_update = time.time() - 61
         last_timer_check = time.time()
         last_runtime_update = time.time()
-        timer_end_time = time.time()
+        state.timer_end_time = time.time()
         last_logged_temp = None
 
+        temperatures = Temperature()
+        
         try:
             running = True
             while running:
                 try:
                     # Check WiFi state first
-                    if not wifi.check_wifi_connection():
+                    if not wifi.check_wifi_connection(state.wifi_state):
+                        state.wifi_state = config.WIFI_STATE_DISCONNECTED
                         time.sleep(5)
-                        machine.wdt.feed()
+                        #feed_watchdog()
                         continue
                         
                     # Handle MQTT connection state
-                    client = handle_mqtt_connection(client, wifi_state)
-                    if not client or mqtt_state != config.MQTT_STATE_CONNECTED:
+                    client = handle_mqtt_connection(client, state)
+                    if not client or state.mqtt_state != config.MQTT_STATE_CONNECTED:
                         time.sleep(4)
-                        machine.wdt.feed()
+                        #feed_watchdog()
                         continue
                         
                     try:
+                        client.ping()
                         client.check_msg()
+                        client.send_queue()
                     except Exception as e:
-                        if isinstance(e, MQTTException) and e.args[0] == 1:
-                            log("MQTT connection closed by host")
-                            set_mqtt_connected(False)
-                            try:
-                                client.disconnect()
-                            except Exception as e:
-                                log(f"ERROR: MQTT - {str(e)}")
-                                pass
-
-                            client = reconnect_with_backoff(client, max_retries=5)
-                            if not client:
-                                log("Failed to reconnect MQTT after maximum retries")
-                                return
-                        else:
-                            log(f"Main loop error: {e}")
-                            set_mqtt_connected(False)
-                            try:
-                                client.disconnect()
-                            except Exception as e:
-                                log(f"ERROR: MQTT - {str(e)}")
-                                pass
-                            time.sleep(1)
+                        log(f"Main loop error: {e}")
+                        set_mqtt_connected(False)
+                        time.sleep(1)
+                        continue
 
                     current_time = time.time()
 
@@ -294,12 +259,12 @@ def main():
                             send_status(client, f"OK TEMP: {temperature:.2f} °F")
                             
                         # Always publish every 60 seconds to Adafruit IO
-                        if current_time - last_temp_update >= 60:
+                        if current_time - last_temp_update >= 20:
                             client.publish(config.AIO_FEED_TEMP, f"{temperature:.2f}")
                             last_temp_update = current_time
                             
-                        relay_control.update_relay_state(temperature, client, state.setpoint, state.temp_diff)
-                        
+                        relay_control.update_relay_state(temperature, client, state)
+
                         # Update runtime and daily cost
                         update_runtime(client)
                         update_daily_cost(client)
@@ -311,33 +276,38 @@ def main():
 
                     wifi.log_wifi_status(client)
                     time.sleep(5)
+                    #feed_watchdog()
                     gc.collect()
 
                     # Timer check and update
-                    if timer_end_time > 0:
-                        if current_time >= timer_end_time:
-                            timer_end_time = 0
-                            current_timer_hours = 0
+                    if state.timer_end_time > 0:
+                        if current_time >= state.timer_end_time:
+                            state.timer_end_time = 0
+                            state.current_timer_hours = 0
                             relay_control.relay_state = False
                             state.relay_state = False
                             client.publish(config.AIO_FEED_RELAY, "OFF")
                             client.publish(config.AIO_FEED_TIMER, "0")
                             log("Timer expired, relay commanded OFF")
                         elif current_time - last_timer_check >= 60:  # Update every minute
-                            remaining_hours = (timer_end_time - current_time) / 3600
-                            if remaining_hours != current_timer_hours:
-                                current_timer_hours = remaining_hours
+                            remaining_hours = (state.timer_end_time - current_time) / 3600
+                            if remaining_hours != state.current_timer_hours:
+                                state.current_timer_hours = remaining_hours
                                 client.publish(config.AIO_FEED_TIMER, f"R:{remaining_hours:.2f}")
                             last_timer_check = current_time
 
                     # Periodic runtime update (every minute)
                     if current_time - last_runtime_update >= 60:
-                        update_runtime(client)
+                        if update_runtime():  # If runtime was updated
+                            # Check if it's time for 15-minute status
+                            if current_time - state.last_runtime_status >= 900:  # 15 minutes = 900 seconds
+                                runtime_msg = format_runtime(state.daily_runtime)
+                                send_status(client, f"OK RUNTIME: {runtime_msg}")
+                                state.last_runtime_status = current_time
                         last_runtime_update = current_time
 
-                except OSError as e:
-                    error_msg = f"ERROR: MQTT connection lost - {str(e)}"
-                    send_status(client, error_msg, force=True)
+                except Exception as e:
+                    log(f"Main loop error: {e}")
                     set_mqtt_connected(False)
                     running = False
                     continue
@@ -349,3 +319,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+

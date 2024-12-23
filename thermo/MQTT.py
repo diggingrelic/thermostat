@@ -1,45 +1,41 @@
 import time
 import gc
 import config as config
-from umqtt.simple2 import MQTTClient
+from umqtt.robust2 import MQTTClient
 from mysecrets import AIO_USERNAME, AIO_KEY
-from Log import log
+from thermo.Log import log
 from thermo.TimeManager import TimeManager
-from thermo.RelayControl import RelayControl
 from thermo.Temperature import Temperature
-class ThermoState:
-    def __init__(self):
-        self.relay_state = False
-        self.setpoint = 70.0
-        self.cycle_delay = 5.0
-        self.temp_diff = 2.0
-        self.min_time_on = 5
-        self.timer_end_time = 0
-        self.current_timer_hours = 0
+from thermo.ThermoState import get_state
 
-# Create a module-level instance
-thermo_state = ThermoState()
-
-def get_state():
-    return thermo_state
-
-relayControl = RelayControl()
 temperatures = Temperature()
 
-current_relay_state = relayControl.current_relay_state
+thermo_state = get_state()
 
-last_mqtt_attempt = time.time()
+last_mqtt_attempt = 0
 timer_end_time = 0
 current_timer_hours = 0
 
-MQTT_KEEPALIVE = 120 
+MQTT_KEEPALIVE = 60
 MQTT_RECONNECT_DELAY = 5
 status_update_interval = 300  # 5 minutes for OK updates
 
+# Add these at the module level (near the top with other initializations)
+last_status_message = ""  # Track last message to prevent duplicates
+last_status_update = 0    # Track when last status was sent
+
+global client
+
+def callback_wrapper(topic, msg, *args):
+    """Wrapper for MQTT callback to handle exceptions"""
+    try:
+        mqtt_callback(topic, msg)
+    except Exception as e:
+        log(f"Callback error: {type(e).__name__}: {str(e)}")
+        all_args = [topic, msg] + list(args)
+        log(f"Args received: {all_args}")
 
 def create_mqtt_client():
-    """Create and configure MQTT client with proper settings"""
-    global client
     client = MQTTClient(
         client_id="pico",
         server=config.AIO_SERVER,
@@ -50,15 +46,16 @@ def create_mqtt_client():
         socket_timeout=5,
         message_timeout=10
     )
+
     return client
 
-def reconnect_with_backoff(client, attempts=5):
+def reconnect_with_backoff(client, max_retries=5):
     """Reconnect to MQTT with exponential backoff"""
+    state = get_state()# Get state object
     delay = MQTT_RECONNECT_DELAY
-    for attempt in range(attempts):
+    for attempt in range(max_retries):
         try:
             log(f"Reconnecting to MQTT broker, attempt {attempt + 1}...")
-            # Properly clean up the old client
             try:
                 client.disconnect()
             except Exception as e:
@@ -68,84 +65,164 @@ def reconnect_with_backoff(client, attempts=5):
             gc.collect()
 
             client = create_mqtt_client()
-            client.set_callback(mqtt_callback)
             client.connect()
             time.sleep(1)
-
-            # Subscribe to all feeds
-            feeds = [
-                config.AIO_FEED_RELAY,
-                config.AIO_FEED_SETPOINT,
-                config.AIO_FEED_CYCLE_DELAY,
-                config.AIO_FEED_TEMP_DIFF,
-                config.AIO_FEED_MIN_TIME_ON,
-                config.AIO_FEED_TIMER
-            ]
             
-            for feed in feeds:
+            for feed in config.SUBSCRIBE_FEEDS:
                 client.subscribe(feed)
                 
             log("Reconnected and subscribed to feeds.")
             send_status(client, "OK RECONNECT: MQTT restored")
+            state.mqtt_state = config.MQTT_STATE_CONNECTED
             return client
-
+            
         except Exception as e:
             log(f"Reconnection attempt {attempt + 1} failed: {e}")
             send_status(client, f"ERROR: MQTT reconnect failed - attempt {attempt + 1}")
             delay *= 2  # Exponential backoff
-            if attempt < attempts - 1:
+            if attempt < max_retries - 1:
                 time.sleep(delay)
 
     log("Failed to reconnect after multiple attempts.")
+    state.mqtt_state = config.MQTT_STATE_DISCONNECTED
     return None
+
+def handle_mqtt_connection(client, state):
+    """Handle MQTT connection state"""
+    thermo_state = get_state()
     
-def handle_mqtt_connection(client, wifi_state):
-    """State machine for MQTT connection handling"""
-    global mqtt_state, last_mqtt_attempt
-    current_time = time.time()
-    MQTT_RETRY_DELAY = 30
-    
-    # Only attempt reconnection if WiFi is available
-    if wifi_state != config.WIFI_STATE_CONNECTED:
-        mqtt_state = config.MQTT_STATE_DISCONNECTED
+    # If client is None, create a new one
+    if client is None:
+        log("Creating new MQTT client")
+        client = create_mqtt_client()
+        client.set_callback(callback_wrapper)
+        thermo_state.client = client  # Store in state
+        
+    if client and not client.is_conn_issue():
         return client
         
-    if mqtt_state == config.MQTT_STATE_DISCONNECTED:
-        if current_time - last_mqtt_attempt >= MQTT_RETRY_DELAY:
-            last_mqtt_attempt = current_time
-            mqtt_state = config.MQTT_STATE_CONNECTING
-            client = reconnect_with_backoff(client)
-            if client:
-                mqtt_state = config.MQTT_STATE_CONNECTED
-                
+    # Connection issue detected
+    set_mqtt_connected(False)
+    state.mqtt_state = config.MQTT_STATE_DISCONNECTED
+    
+    try:
+        if client:
+            client.disconnect()
+    except Exception as e:
+        log(f"Error during disconnect: {e}")
+    
+    try:
+        # Create new client if needed
+        if client is None:
+            client = create_mqtt_client()
+            client.set_callback(callback_wrapper)
+            thermo_state.client = client  # Store in state
+            
+        # Attempt reconnection
+        client.connect()
+        set_mqtt_connected(True)
+        state.mqtt_state = config.MQTT_STATE_CONNECTED
+        thermo_state.client = client  # Ensure state has latest client
+        
+        # Resubscribe to all topics
+        for feed in config.SUBSCRIBE_FEEDS:
+            client.subscribe(feed)
+            time.sleep(1)
+            
+        send_status(client, "OK RECONNECT: MQTT restored")
+        return client
+            
+    except Exception as e:
+        log(f"Reconnection error: {e}")
+        time.sleep(5)
+        
     return client
 
-def set_mqtt_connected(success=True):
-    """Set MQTT state and log the change"""
-    global mqtt_state
-    mqtt_state = config.MQTT_STATE_CONNECTED if success else config.MQTT_STATE_DISCONNECTED
-    if config.debug:
-        log(f"MQTT state changed to: {'CONNECTED' if success else 'DISCONNECTED'}")
+def set_mqtt_connected(connected):
+    """Update MQTT connection state"""
+    state = get_state()
+    if connected:
+        state.mqtt_state = config.MQTT_STATE_CONNECTED
+    else:
+        state.mqtt_state = config.MQTT_STATE_DISCONNECTED
+    log(f"MQTT state changed to: {state.mqtt_state}")
 
-def mqtt_callback(topic, msg, retained=False, duplicate=False):
-    """
-    Callback for received subscription messages.
+def get_initial_state(mqtt_client):
+    """Fetch initial state from Adafruit IO"""
+    global client
+    client = mqtt_client
     
-    Args:
-        topic: The topic the message was received on
-        msg: The message content
-        retained: Boolean indicating if this was a retained message
-        duplicate: Boolean indicating if this was a duplicate delivery
-    """
+    log("Fetching initial state...")
+    max_attempts = 3
+    
+    # Initialize a dictionary to track the reception of each feed
+    feed_received = {
+        'relay': False,
+        'setpoint': False,
+        'cycle_delay': False,
+        'temp_diff': False,
+        'min_time_on': False
+    }
+    
+    def check_received():
+        """Check if all feed values have been received"""
+        return all(feed_received.values())
+    
+    for attempt in range(max_attempts):
+        if check_received():
+            log("Received all initial values.")
+            break
+        
+        log(f"Starting attempt {attempt + 1} of {max_attempts}")
+        
+        # Request values for feeds that haven't been received yet
+        for feed, received in feed_received.items():
+            if not received:
+                feed_name = getattr(config, f'AIO_FEED_{feed.upper()}')
+                mqtt_client.get(feed_name)
+                log(f"Requested value for {feed}")
+                time.sleep(1)  # Small delay between requests
+        
+        # Wait for responses
+        timeout = time.time() + 2  # 2 second timeout
+        while time.time() < timeout:
+            if client:
+                client.check_msg()
+            time.sleep(0.1)
+        
+        log(f"Completed attempt {attempt + 1} of {max_attempts}")
+        
+        if not check_received() and attempt < max_attempts - 1:
+            time.sleep(2)  # Wait 2 seconds before next attempt
+            log("Retrying initial state fetch...")
+    
+    if not check_received():
+        missing_feeds = [feed for feed, received in feed_received.items() if not received]
+        log(f"Failed to receive all values. Missing: {', '.join(missing_feeds)}")
+        return False
+    
+    log("Initial state fetch complete")
+    return True
+
+def mqtt_callback(topic, msg):
+    """MQTT callback function"""
+
+    # Get a reference to the current client
+    current_client = thermo_state.client  # Use the global client
     topic_str = topic.decode() if isinstance(topic, bytes) else topic
     msg_str = msg.decode()
     
     log(f"MQTT message received - Topic: {topic_str}, Message: {msg_str}")
     
+    if current_client is None:
+        log("Warning: MQTT client is None during callback")
+        return
+        
     if topic_str == "time/seconds":
         time_manager = TimeManager(client, log)
         if time_manager:
             time_manager.handle_time_message(msg)
+
     elif topic_str == config.AIO_FEED_RELAY:
         new_relay_state = msg_str.lower() == "on"
         if new_relay_state != thermo_state.relay_state:
@@ -154,11 +231,12 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
             if not thermo_state.relay_state and thermo_state.timer_end_time > 0:
                 thermo_state.timer_end_time = 0
                 thermo_state.current_timer_hours = 0
-                client.publish(config.AIO_FEED_TIMER, "0")  # Update timer feed
+                current_client.publish(config.AIO_FEED_TIMER, "0")  # Update timer feed
                 log("Timer cancelled due to relay OFF command")
-            log(f"Relay command received: {thermo_state.relay_state} (Actual state: {current_relay_state}, min time holding: {current_relay_state and not thermo_state.relay_state})")
+            log(f"Relay command received: {thermo_state.relay_state} (Actual state: {thermo_state.current_relay_state}, min time holding: {thermo_state.current_relay_state and not thermo_state.relay_state})")
         else:
-            log(f"Relay command unchanged: command={thermo_state.relay_state}, actual={current_relay_state}")
+            log(f"Relay command unchanged: command={thermo_state.relay_state}, actual={thermo_state.current_relay_state}")
+
     elif topic_str == config.AIO_FEED_SETPOINT:
         try:
             new_setpoint = float(msg_str)
@@ -170,6 +248,7 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
                 log(f"Setpoint unchanged: current={thermo_state.setpoint}, received={new_setpoint}")
         except ValueError:
             log("Invalid setpoint value received")
+            
     elif topic_str == config.AIO_FEED_CYCLE_DELAY:
         try:
             new_cycle_delay = float(msg_str)
@@ -184,6 +263,7 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
                 log(f"Cycle delay unchanged: current={thermo_state.cycle_delay}, received={new_cycle_delay}")
         except ValueError:
             log("Invalid cycle delay value received")
+            
     elif topic_str == config.AIO_FEED_TEMP_DIFF:
         try:
             new_temp_diff = float(msg_str)
@@ -198,6 +278,7 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
                 log(f"Temperature differential unchanged: current={thermo_state.temp_diff}, received={new_temp_diff}")
         except ValueError:
             log("Invalid temperature differential value received")
+            
     elif topic_str == config.AIO_FEED_MIN_TIME_ON:
         try:
             new_min_time = float(msg_str)
@@ -212,6 +293,7 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
                 log(f"Minimum on-time unchanged: current={thermo_state.min_time_on}, received={new_min_time}")
         except ValueError:
             log("Invalid minimum on-time value received")
+
     elif topic_str == config.AIO_FEED_HEATER_STATUS:
         try:
             new_status = int(msg_str)
@@ -220,6 +302,7 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
                 log(f"Heater status updated: {thermo_state.heater_status}")
         except ValueError:
             log("Invalid heater status value received")
+
     elif topic_str == config.AIO_FEED_TIMER:
         try:
             if msg_str.startswith('R:'):  # Handle remaining time updates
@@ -237,7 +320,8 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
                     thermo_state.timer_end_time = 0
                     thermo_state.current_timer_hours = 0
                     thermo_state.relay_state = False
-                    client.publish(config.AIO_FEED_RELAY, "OFF")
+                    if current_client:  # Check if client still exists
+                        current_client.publish(config.AIO_FEED_RELAY, "OFF")
                     log("Timer cancelled, relay commanded OFF")
             else:
                 hours = float(msg_str)
@@ -245,7 +329,8 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
                     thermo_state.timer_end_time = time.time() + (hours * 3600)  # Convert to seconds
                     thermo_state.current_timer_hours = hours
                     thermo_state.relay_state = True
-                    client.publish(config.AIO_FEED_RELAY, "ON")
+                    if current_client:  # Check if client still exists
+                        current_client.publish(config.AIO_FEED_RELAY, "ON")
                     log(f"Timer set for {hours:.1f} hours, relay commanded ON")
                 else:
                     log(f"Invalid timer duration: {hours} (must be between 1-12 hours)")
@@ -253,14 +338,7 @@ def mqtt_callback(topic, msg, retained=False, duplicate=False):
             log(f"Invalid timer format: {msg_str} (use hours between 1-12)")
 
 def send_status(client, message, force=False):
-    """
-    Send status update to status feed.
-    Args:
-        client: MQTT client
-        message: Status message without timestamp
-        force: If True, send even if duplicate
-    """
-    global last_status_update, last_status_message
+    global last_status_message, last_status_update
     current_time = time.time()
     
     # Don't send duplicate errors within 5 minutes unless forced
@@ -274,7 +352,7 @@ def send_status(client, message, force=False):
     if message.startswith("OK") and not message.startswith("OK BOOT"):
         temp = temperatures.get_valid_temperature()
         state_info = (f"T:{temp:.1f}F S:{thermo_state.setpoint:.1f}F "
-                     f"H:{'ON' if current_relay_state else 'OFF'}")
+                     f"H:{'ON' if thermo_state.current_relay_state else 'OFF'}")
         if thermo_state.timer_end_time > 0:
             hours_left = (thermo_state.timer_end_time - current_time) / 3600
             state_info += f" TMR:{hours_left:.1f}h"
@@ -286,11 +364,15 @@ def send_status(client, message, force=False):
         (message.startswith("OK") and current_time - last_status_update >= status_update_interval)):
         
         try:
-            client.publish(config.AIO_FEED_STATUS, message[:127])  # Limit to 128 chars
-            log(f"Status update: {message}")
+            # The robust2 library will queue the message if it can't send immediately
+            client.publish(config.AIO_FEED_STATUS, message[:125])
+            log(f"Status queued/sent: {message}")
+
+            # Update our tracking variables
             last_status_message = message
             last_status_update = current_time
-            if config.debug:
-                log(f"Status update: {message}")
+            return True
+            
         except Exception as e:
-            log(f"Failed to send status: {e}")
+            log(f"Failed to queue status: {type(e).__name__} - {str(e)}")
+            return False

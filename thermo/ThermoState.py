@@ -23,6 +23,7 @@ class ThermoState:
         self.daily_runtime = 0
         self.last_relay_change = time.time() - 3600
         self.heater_start_time = 0
+        self.is_startup = True
 
 # Create a module-level instance
 thermo_state = ThermoState()

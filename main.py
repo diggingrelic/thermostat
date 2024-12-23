@@ -59,9 +59,9 @@ else:
     state.wifi_state = config.WIFI_STATE_CONNECTED
 
 # Now enable watchdog after successful connection
-#wdt = machine.WDT(timeout=8000)
-#wifi.wdt = wdt  # Update WiFi instance with new WDT
-#wifi.watchdog_enabled = True
+wdt = machine.WDT(timeout=8000)
+wifi.wdt = wdt  # Update WiFi instance with new WDT
+wifi.watchdog_enabled = True
 
 relay_control = RelayControl()
 
@@ -87,18 +87,19 @@ def get_initial_state(client, retries=3):
         received_values = set()
         
         # Request values
-        client.publish(config.AIO_FEED_RELAY + "/get", "")
-        time.sleep(0.5)
-        client.publish(config.AIO_FEED_SETPOINT + "/get", "")
-        time.sleep(0.1)
-        client.publish(config.AIO_FEED_CYCLE_DELAY + "/get", "")
-        time.sleep(0.1)
-        client.publish(config.AIO_FEED_TEMP_DIFF + "/get", "")
-        time.sleep(0.1)
-        client.publish(config.AIO_FEED_MIN_TIME_ON + "/get", "")
-        time.sleep(0.1)
         client.publish(config.AIO_FEED_TIMER + "/get", "")
-        time.sleep(0.1)
+        time.sleep(1)
+        feed_watchdog()
+        client.publish(config.AIO_FEED_RELAY + "/get", "")
+        time.sleep(.1)
+        client.publish(config.AIO_FEED_SETPOINT + "/get", "")
+        time.sleep(.1)
+        client.publish(config.AIO_FEED_CYCLE_DELAY + "/get", "")
+        time.sleep(.1)
+        client.publish(config.AIO_FEED_TEMP_DIFF + "/get", "")
+        time.sleep(.1)
+        client.publish(config.AIO_FEED_MIN_TIME_ON + "/get", "")
+        time.sleep(.1)
         
         timeout = time.time() + 5
         while time.time() < timeout:
@@ -170,39 +171,39 @@ def update_daily_cost(client, force=False):
 
 def feed_watchdog():
     """Safe watchdog feed with enable/disable flag"""
-    #if wifi.watchdog_enabled and wifi.wdt:
-    #    wifi.wdt.feed()
+    if wifi.watchdog_enabled and wifi.wdt:
+        wifi.wdt.feed()
 
 def main():
-    #feed_watchdog()
+    feed_watchdog()
 
     if state.wifi_state == config.WIFI_STATE_CONNECTED:
-        #feed_watchdog()
-        client = create_mqtt_client()
-        client.set_callback(callback_wrapper)
-        state.client = client
+        state.client = create_mqtt_client()
+        state.client.set_callback(callback_wrapper)
+        feed_watchdog()
 
         try:
             log("Attempting MQTT connection...")
-            client.connect()
+            state.client.connect()
             set_mqtt_connected(True)
             log("MQTT connected successfully")
             
             for feed in config.SUBSCRIBE_FEEDS:
-                client.subscribe(feed)
+                state.client.subscribe(feed)
                 time.sleep(1)
-                #feed_watchdog()
+                feed_watchdog()
             
-            time_manager = TimeManager(client, log) #?????
+            time_manager = TimeManager(state.client, log) #?????
             
-            if not get_initial_state(client):
-                send_status(client, "ERROR: Failed to get initial state restarting...")
-                time.sleep(5)
+            if not get_initial_state(state.client):
+                send_status(state.client, "ERROR: Failed to get initial state restarting...")
+                time.sleep(3)
                 machine.reset()
                 return
             
-            send_status(client, "OK BOOT: System ready", force=True)
-            
+            send_status(state.client, "OK BOOT: System ready", force=True)
+            feed_watchdog()
+
         except Exception as e:
             log(f"Failed to connect to MQTT broker: {e}")
             return
@@ -211,10 +212,11 @@ def main():
         last_temp_update = time.time() - 61
         last_timer_check = time.time()
         last_runtime_update = time.time()
-        state.timer_end_time = time.time()
         last_logged_temp = None
 
         temperatures = Temperature()
+
+        state.is_startup = False
         
         try:
             running = True
@@ -223,18 +225,19 @@ def main():
                     # Check WiFi state first
                     if not wifi.check_wifi_connection(state.wifi_state):
                         state.wifi_state = config.WIFI_STATE_DISCONNECTED
-                        time.sleep(5)
-                        #feed_watchdog()
+                        time.sleep(1)
+                        feed_watchdog()
                         continue
                         
                     # Handle MQTT connection state
-                    client = handle_mqtt_connection(client, state)
+                    client = handle_mqtt_connection(state.client, state)
                     if not client or state.mqtt_state != config.MQTT_STATE_CONNECTED:
-                        time.sleep(4)
-                        #feed_watchdog()
+                        time.sleep(1)
+                        feed_watchdog()
                         continue
                         
                     try:
+                        feed_watchdog()
                         client.ping()
                         client.check_msg()
                         client.send_queue()
@@ -251,12 +254,13 @@ def main():
                         time_manager.check_sync_needed()
 
                     try:
+                        feed_watchdog()
                         temperature = temperatures.get_valid_temperature()
                         
                         # Only log if significant change
                         if last_logged_temp is None or abs(temperature - last_logged_temp) > 1:
                             last_logged_temp = temperature
-                            send_status(client, f"OK TEMP: {temperature:.2f} °F")
+                            send_status(client, f"OK TEMP: {temperature:.2f} F")
                             
                         # Always publish every 60 seconds to Adafruit IO
                         if current_time - last_temp_update >= 20:
@@ -275,8 +279,9 @@ def main():
                         continue
 
                     wifi.log_wifi_status(client)
+                    feed_watchdog()
                     time.sleep(5)
-                    #feed_watchdog()
+                    feed_watchdog()
                     gc.collect()
 
                     # Timer check and update
@@ -284,7 +289,6 @@ def main():
                         if current_time >= state.timer_end_time:
                             state.timer_end_time = 0
                             state.current_timer_hours = 0
-                            relay_control.relay_state = False
                             state.relay_state = False
                             client.publish(config.AIO_FEED_RELAY, "OFF")
                             client.publish(config.AIO_FEED_TIMER, "0")
@@ -305,6 +309,8 @@ def main():
                                 send_status(client, f"OK RUNTIME: {runtime_msg}")
                                 state.last_runtime_status = current_time
                         last_runtime_update = current_time
+
+                    feed_watchdog()
 
                 except Exception as e:
                     log(f"Main loop error: {e}")

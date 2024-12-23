@@ -25,6 +25,7 @@ last_status_message = ""  # Track last message to prevent duplicates
 last_status_update = 0    # Track when last status was sent
 
 global client
+client = thermo_state.client
 
 def callback_wrapper(topic, msg, *args):
     """Wrapper for MQTT callback to handle exceptions"""
@@ -147,63 +148,6 @@ def set_mqtt_connected(connected):
         state.mqtt_state = config.MQTT_STATE_DISCONNECTED
     log(f"MQTT state changed to: {state.mqtt_state}")
 
-def get_initial_state(mqtt_client):
-    """Fetch initial state from Adafruit IO"""
-    global client
-    client = mqtt_client
-    
-    log("Fetching initial state...")
-    max_attempts = 3
-    
-    # Initialize a dictionary to track the reception of each feed
-    feed_received = {
-        'relay': False,
-        'setpoint': False,
-        'cycle_delay': False,
-        'temp_diff': False,
-        'min_time_on': False
-    }
-    
-    def check_received():
-        """Check if all feed values have been received"""
-        return all(feed_received.values())
-    
-    for attempt in range(max_attempts):
-        if check_received():
-            log("Received all initial values.")
-            break
-        
-        log(f"Starting attempt {attempt + 1} of {max_attempts}")
-        
-        # Request values for feeds that haven't been received yet
-        for feed, received in feed_received.items():
-            if not received:
-                feed_name = getattr(config, f'AIO_FEED_{feed.upper()}')
-                mqtt_client.get(feed_name)
-                log(f"Requested value for {feed}")
-                time.sleep(1)  # Small delay between requests
-        
-        # Wait for responses
-        timeout = time.time() + 2  # 2 second timeout
-        while time.time() < timeout:
-            if client:
-                client.check_msg()
-            time.sleep(0.1)
-        
-        log(f"Completed attempt {attempt + 1} of {max_attempts}")
-        
-        if not check_received() and attempt < max_attempts - 1:
-            time.sleep(2)  # Wait 2 seconds before next attempt
-            log("Retrying initial state fetch...")
-    
-    if not check_received():
-        missing_feeds = [feed for feed, received in feed_received.items() if not received]
-        log(f"Failed to receive all values. Missing: {', '.join(missing_feeds)}")
-        return False
-    
-    log("Initial state fetch complete")
-    return True
-
 def mqtt_callback(topic, msg):
     """MQTT callback function"""
 
@@ -222,6 +166,44 @@ def mqtt_callback(topic, msg):
         time_manager = TimeManager(client, log)
         if time_manager:
             time_manager.handle_time_message(msg)
+
+    elif topic_str == config.AIO_FEED_TIMER:        
+        try:
+            if msg_str.startswith('R:'):  # Handle remaining time updates
+                if thermo_state.timer_end_time == 0:  # Only process if we're initializing
+                    hours = float(msg_str[2:])  # Skip "R:" prefix
+                    if hours > 0:  # If there's time remaining
+                        thermo_state.timer_end_time = time.time() + (hours * 3600)  # Convert to seconds
+                        thermo_state.current_timer_hours = hours
+                        thermo_state.relay_state = True
+                        log(f"Timer restored: {hours:.2f} hours remaining")
+                return
+                
+            if msg_str.lower() in ('0', 'off'):
+                if thermo_state.timer_end_time > 0:
+                    thermo_state.timer_end_time = 0
+                    thermo_state.current_timer_hours = 0
+                    if not thermo_state.is_startup:
+                        thermo_state.relay_state = False
+                        thermo_state.is_startup = False
+                        if current_client:  # Check if client still exists
+                            current_client.publish(config.AIO_FEED_RELAY, "OFF")
+                        log("Timer cancelled, relay commanded OFF")
+                    else:
+                        pass
+            else:
+                hours = float(msg_str)
+                if 1 <= hours <= 12:  # Between 1 and 12 hours
+                    thermo_state.timer_end_time = time.time() + (hours * 3600)  # Convert to seconds
+                    thermo_state.current_timer_hours = hours
+                    thermo_state.relay_state = True
+                    if current_client:  # Check if client still exists
+                        current_client.publish(config.AIO_FEED_RELAY, "ON")
+                    log(f"Timer set for {hours:.1f} hours, relay commanded ON")
+                else:
+                    log(f"Invalid timer duration: {hours} (must be between 1-12 hours)")
+        except ValueError:
+            log(f"Invalid timer format: {msg_str} (use hours between 1-12)")
 
     elif topic_str == config.AIO_FEED_RELAY:
         new_relay_state = msg_str.lower() == "on"
@@ -271,9 +253,9 @@ def mqtt_callback(topic, msg):
                 if 1 <= new_temp_diff <= 5:
                     current = thermo_state.temp_diff  # Store current value
                     thermo_state.temp_diff = new_temp_diff
-                    log(f"Temperature differential: {current} -> {thermo_state.temp_diff}°F")
+                    log(f"Temperature differential: {current} -> {thermo_state.temp_diff} F")
                 else:
-                    log(f"Invalid temperature differential value: {new_temp_diff} (must be between 1-5°F)")
+                    log(f"Invalid temperature differential value: {new_temp_diff} (must be between 1-5 F)")
             else:
                 log(f"Temperature differential unchanged: current={thermo_state.temp_diff}, received={new_temp_diff}")
         except ValueError:
@@ -303,39 +285,6 @@ def mqtt_callback(topic, msg):
         except ValueError:
             log("Invalid heater status value received")
 
-    elif topic_str == config.AIO_FEED_TIMER:
-        try:
-            if msg_str.startswith('R:'):  # Handle remaining time updates
-                if thermo_state.timer_end_time == 0:  # Only process if we're initializing
-                    hours = float(msg_str[2:])  # Skip "R:" prefix
-                    if hours > 0:  # If there's time remaining
-                        thermo_state.timer_end_time = time.time() + (hours * 3600)  # Convert to seconds
-                        thermo_state.current_timer_hours = hours
-                        thermo_state.relay_state = True
-                        log(f"Timer restored: {hours:.2f} hours remaining")
-                return
-                
-            if msg_str.lower() in ('0', 'off'):
-                if thermo_state.timer_end_time > 0:
-                    thermo_state.timer_end_time = 0
-                    thermo_state.current_timer_hours = 0
-                    thermo_state.relay_state = False
-                    if current_client:  # Check if client still exists
-                        current_client.publish(config.AIO_FEED_RELAY, "OFF")
-                    log("Timer cancelled, relay commanded OFF")
-            else:
-                hours = float(msg_str)
-                if 1 <= hours <= 12:  # Between 1 and 12 hours
-                    thermo_state.timer_end_time = time.time() + (hours * 3600)  # Convert to seconds
-                    thermo_state.current_timer_hours = hours
-                    thermo_state.relay_state = True
-                    if current_client:  # Check if client still exists
-                        current_client.publish(config.AIO_FEED_RELAY, "ON")
-                    log(f"Timer set for {hours:.1f} hours, relay commanded ON")
-                else:
-                    log(f"Invalid timer duration: {hours} (must be between 1-12 hours)")
-        except ValueError:
-            log(f"Invalid timer format: {msg_str} (use hours between 1-12)")
 
 def send_status(client, message, force=False):
     global last_status_message, last_status_update

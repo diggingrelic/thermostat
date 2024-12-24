@@ -38,7 +38,7 @@ class RelayControl:
 
 #Helper functions
 def turn_on_relay(state, client, relay_pin, led):
-    update_runtime(force_update=True)
+    
     relay_pin.on()
     led.on()
     state.current_relay_state = True
@@ -46,11 +46,12 @@ def turn_on_relay(state, client, relay_pin, led):
     state.heater_status = 1
     state.heater_start_time = time.time()
     state.last_runtime_update = time.time()
-    state.last_runtime_status = time.time()
     client.publish(AIO_FEED_HEATER_STATUS, "1")
     log("Relay turned ON")
+    update_runtime(force_update=True)
 
 def turn_off_relay(state, client, relay_pin, led):
+    update_runtime(force_update=True)
     relay_pin.off()
     led.off()
     state.current_relay_state = False
@@ -58,7 +59,6 @@ def turn_off_relay(state, client, relay_pin, led):
     state.heater_status = 0
     state.heater_start_time = 0
     state.last_runtime_update = 0
-    state.last_runtime_status = 0
     state.last_relay_change = time.time()
     client.publish(AIO_FEED_HEATER_STATUS, "0")
     log("Relay turned OFF")

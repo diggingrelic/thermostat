@@ -2,9 +2,7 @@
 import time
 import machine
 import gc
-#from umqtt.simple2 import MQTTException
 import config
-from thermo.TimeManager import TimeManager
 from thermo.PinDriveStrength import set_pin_drive_strength
 from thermo.Log import log
 from thermo.ThermoState import get_state, update_runtime, format_runtime
@@ -12,13 +10,14 @@ from thermo.MQTT import send_status, set_mqtt_connected, handle_mqtt_connection,
 from thermo.WiFi import WiFi
 from thermo.RelayControl import RelayControl
 from thermo.Temperature import Temperature
+from thermo.CostCalculator import CostCalculator
+
+# TODO: Remove is_startup flag and move watchdog to ThermoState
+# TODO: Move get_initial_state to MQTT
+# TODO: Tidy up main loop and initialized variables
 
 # Check reset cause (using available constants)
 reset_cause = machine.reset_cause()
-if reset_cause == 3:  # 3 is typically WDT reset
-    log("Watchdog reset occurred")
-else:
-    log("Normal startup")
 
 # Initialize controllers
 led = machine.Pin("LED", machine.Pin.OUT)
@@ -27,8 +26,6 @@ set_pin_drive_strength(14, 12)
 
 # Initialize runtime tracking
 heater_start_time = 0  # Track when heater turns on
-total_runtime = 0  # Track accumulated runtime in minutes
-daily_runtime = 0  # Track runtime for current day
 
 # Initialize status tracking
 last_status_message = ""  # Track last message to prevent duplicates
@@ -43,8 +40,8 @@ state.mqtt_state = config.MQTT_STATE_DISCONNECTED
 state.timer_end_time = 0  # When timer should finish (0 = no timer)
 state.current_timer_hours = 0  # Current timer value for feed updates
 
-# Initialize time management
-time_manager = None  # Initialize time_manager as None
+relay_control = RelayControl()
+cost_calculator = CostCalculator()
 
 # Initialize with no watchdog
 wdt = None
@@ -63,12 +60,8 @@ wdt = machine.WDT(timeout=8000)
 wifi.wdt = wdt  # Update WiFi instance with new WDT
 wifi.watchdog_enabled = True
 
-relay_control = RelayControl()
-
 last_status_update = 0
 last_runtime_status = 0  # Track last runtime status message
-
-last_daily_post = 0  # Track when we last posted daily cost
 
 last_wifi_status = None
 last_wifi_check = 0
@@ -80,6 +73,11 @@ def blink_led(times, delay):
         time.sleep(delay)
         led.off()
         time.sleep(delay)
+
+def feed_watchdog():
+    """Safe watchdog feed with enable/disable flag"""
+    if wifi.watchdog_enabled and wifi.wdt:
+        wifi.wdt.feed()
 
 def get_initial_state(client, retries=3):
     for retry in range(retries):
@@ -99,6 +97,8 @@ def get_initial_state(client, retries=3):
         client.publish(config.AIO_FEED_TEMP_DIFF + "/get", "")
         time.sleep(.1)
         client.publish(config.AIO_FEED_MIN_TIME_ON + "/get", "")
+        time.sleep(.1)
+        client.subscribe("time/seconds")
         time.sleep(.1)
         
         timeout = time.time() + 5
@@ -140,40 +140,6 @@ def get_initial_state(client, retries=3):
     
     return False
 
-def update_daily_cost(client, force=False):
-    """Update daily cost at 10:45 PM or when forced"""
-    global daily_runtime, last_daily_post
-    
-    current_time = time.localtime()
-    
-    # Check if it's 10:45 PM (22:45) or if force update requested
-    if force or (current_time[3] == 22 and current_time[4] == 45):
-        # Only post once per day
-        if last_daily_post != current_time[7]:  # current_time[7] is day of year
-            # Convert runtime from minutes to hours and calculate cost
-            daily_cost = (daily_runtime / 60) * config.HEATER_COST_PER_HOUR
-            
-            try:
-                client.publish(config.AIO_FEED_DAILY_COST, f"{daily_cost:.2f}")
-                log(f"Daily cost posted: ${daily_cost:.2f} ({daily_runtime} minutes)")
-                send_status(client, f"OK DAILY: Cost=${daily_cost:.2f} Runtime={format_runtime(daily_runtime)}")
-                
-                # Add status message before reset
-                send_status(client, f"OK RESET: Daily runtime reset from {format_runtime(daily_runtime)} to 0")
-                
-                # Reset for next day
-                last_daily_post = current_time[7]
-                daily_runtime = 0
-                
-            except Exception as e:
-                log(f"Failed to post daily cost: {e}")
-                send_status(client, f"ERROR: Failed to post daily cost - {str(e)}")
-
-def feed_watchdog():
-    """Safe watchdog feed with enable/disable flag"""
-    if wifi.watchdog_enabled and wifi.wdt:
-        wifi.wdt.feed()
-
 def main():
     feed_watchdog()
 
@@ -187,13 +153,20 @@ def main():
             state.client.connect()
             set_mqtt_connected(True)
             log("MQTT connected successfully")
+            if reset_cause == 3:
+                send_status(state.client, "ERROR: Watchdog reset occurred")
+                log("Watchdog reset occurred")
+            else:
+                send_status(state.client, "OK BOOT: Normal startup", force=True)
+                log("Normal startup")
             
             for feed in config.SUBSCRIBE_FEEDS:
                 state.client.subscribe(feed)
                 time.sleep(1)
                 feed_watchdog()
             
-            time_manager = TimeManager(state.client, log) #?????
+            # Initialize time manager
+            time_manager = state.timeManager
             
             if not get_initial_state(state.client):
                 send_status(state.client, "ERROR: Failed to get initial state restarting...")
@@ -250,8 +223,9 @@ def main():
                     current_time = time.time()
 
                     # Time sync check (only when needed)
-                    if time_manager:
-                        time_manager.check_sync_needed()
+                    state.last_sync = time_manager.check_sync_needed(state.last_sync)
+                    if time_manager.sync_needed:
+                        state.client.publish(f"{config.AIO_USERNAME}/feeds/time/get", "")
 
                     try:
                         feed_watchdog()
@@ -270,9 +244,20 @@ def main():
                         relay_control.update_relay_state(temperature, client, state)
 
                         # Update runtime and daily cost
-                        update_runtime(client)
-                        update_daily_cost(client)
-                        
+                        if update_runtime(force_update=True):
+                            # Store current session start time if heater is ON
+                            current_session_start = None
+                            if state.current_relay_state and state.heater_start_time > 0:
+                                current_session_start = state.heater_start_time
+                            
+                            # Calculate and post daily cost
+                            cost_calculator.update_daily_cost()
+                            
+                            # Restore session start time if heater was ON
+                            if current_session_start:
+                                state.heater_start_time = current_session_start
+                                state.last_runtime_update = current_session_start
+
                     except RuntimeError as e:
                         error_msg = f"ERROR: Temperature sensor - {str(e)}"
                         send_status(client, error_msg, force=True)

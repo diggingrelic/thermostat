@@ -4,9 +4,8 @@ import config as config
 from umqtt.robust2 import MQTTClient
 from mysecrets import AIO_USERNAME, AIO_KEY
 from thermo.Log import log
-from thermo.TimeManager import TimeManager
 from thermo.Temperature import Temperature
-from thermo.ThermoState import get_state
+from thermo.ThermoState import get_state, format_runtime
 
 temperatures = Temperature()
 
@@ -90,7 +89,6 @@ def reconnect_with_backoff(client, max_retries=5):
 
 def handle_mqtt_connection(client, state):
     """Handle MQTT connection state"""
-    thermo_state = get_state()
     
     # If client is None, create a new one
     if client is None:
@@ -150,22 +148,15 @@ def set_mqtt_connected(connected):
 
 def mqtt_callback(topic, msg):
     """MQTT callback function"""
-
-    # Get a reference to the current client
-    current_client = thermo_state.client  # Use the global client
     topic_str = topic.decode() if isinstance(topic, bytes) else topic
     msg_str = msg.decode()
     
     log(f"MQTT message received - Topic: {topic_str}, Message: {msg_str}")
     
-    if current_client is None:
-        log("Warning: MQTT client is None during callback")
-        return
-        
     if topic_str == "time/seconds":
-        time_manager = TimeManager(client, log)
-        if time_manager:
-            time_manager.handle_time_message(msg)
+        log("Time message received - Processing update from Adafruit IO")
+        thermo_state.last_sync = thermo_state.timeManager.handle_time_message(msg, thermo_state.last_sync)
+        log(f"Time sync complete - New last_sync: {thermo_state.last_sync}")
 
     elif topic_str == config.AIO_FEED_TIMER:        
         try:
@@ -186,8 +177,8 @@ def mqtt_callback(topic, msg):
                     if not thermo_state.is_startup:
                         thermo_state.relay_state = False
                         thermo_state.is_startup = False
-                        if current_client:  # Check if client still exists
-                            current_client.publish(config.AIO_FEED_RELAY, "OFF")
+                        if thermo_state.client:  # Check if client still exists
+                            thermo_state.client.publish(config.AIO_FEED_RELAY, "OFF")
                         log("Timer cancelled, relay commanded OFF")
                     else:
                         pass
@@ -197,8 +188,8 @@ def mqtt_callback(topic, msg):
                     thermo_state.timer_end_time = time.time() + (hours * 3600)  # Convert to seconds
                     thermo_state.current_timer_hours = hours
                     thermo_state.relay_state = True
-                    if current_client:  # Check if client still exists
-                        current_client.publish(config.AIO_FEED_RELAY, "ON")
+                    if thermo_state.client:  # Check if client still exists
+                        thermo_state.client.publish(config.AIO_FEED_RELAY, "ON")
                     log(f"Timer set for {hours:.1f} hours, relay commanded ON")
                 else:
                     log(f"Invalid timer duration: {hours} (must be between 1-12 hours)")
@@ -213,7 +204,7 @@ def mqtt_callback(topic, msg):
             if not thermo_state.relay_state and thermo_state.timer_end_time > 0:
                 thermo_state.timer_end_time = 0
                 thermo_state.current_timer_hours = 0
-                current_client.publish(config.AIO_FEED_TIMER, "0")  # Update timer feed
+                thermo_state.client.publish(config.AIO_FEED_TIMER, "0")  # Update timer feed
                 log("Timer cancelled due to relay OFF command")
             log(f"Relay command received: {thermo_state.relay_state} (Actual state: {thermo_state.current_relay_state}, min time holding: {thermo_state.current_relay_state and not thermo_state.relay_state})")
         else:
@@ -285,6 +276,14 @@ def mqtt_callback(topic, msg):
         except ValueError:
             log("Invalid heater status value received")
 
+def get_time_for_manager():
+    thermo_state.client.publish(f"{AIO_USERNAME}/feeds/time/get", "")
+
+def send_daily_cost(daily_cost):
+    client.publish(config.AIO_FEED_DAILY_COST, f"{daily_cost:.2f}")
+    log(f"Daily cost posted: ${daily_cost:.2f} ({thermo_state.daily_runtime} minutes)")
+    send_status(client, f"OK DAILY: Cost=${daily_cost:.2f} Runtime={format_runtime(thermo_state.daily_runtime)}")
+    send_status(client, f"OK RESET: Daily runtime reset from {format_runtime(thermo_state.daily_runtime)} to 0")
 
 def send_status(client, message, force=False):
     global last_status_message, last_status_update

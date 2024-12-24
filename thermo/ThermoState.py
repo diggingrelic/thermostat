@@ -1,5 +1,8 @@
 from config import MQTT_STATE_DISCONNECTED
 import time
+from thermo.TimeManager import TimeManager
+
+# TODO: Remove is_startup flag
 
 class ThermoState:
     def __init__(self):
@@ -20,10 +23,14 @@ class ThermoState:
         self.heater_start_time = 0
         self.last_runtime_update = 0
         self.last_runtime_status = 0
-        self.daily_runtime = 0
         self.last_relay_change = time.time() - 3600
         self.heater_start_time = 0
         self.is_startup = True
+        self.last_sync = 0
+        self.timeManager = TimeManager()
+        # For CostCalculator
+        self.daily_runtime = 0
+        self.last_daily_post = 0
 
 # Create a module-level instance
 thermo_state = ThermoState()

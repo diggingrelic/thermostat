@@ -31,6 +31,7 @@ class ThermoState:
         # For CostCalculator
         self.daily_runtime = 0
         self.last_daily_post = 0
+        self.daily_runtime_seconds = 0  # Track in seconds instead of minutes
 
 # Create a module-level instance
 thermo_state = ThermoState()
@@ -42,8 +43,9 @@ def set_client(new_client):
     """Update the client reference"""
     thermo_state.client = new_client
 
-def format_runtime(minutes):
-    """Convert total minutes to 'X hours & Y min' format"""
+def format_runtime(seconds):
+    """Convert seconds to display format"""
+    minutes = seconds / 60
     hours = int(minutes // 60)
     mins = int(minutes % 60)
     if hours > 0:
@@ -51,18 +53,24 @@ def format_runtime(minutes):
     return f"{mins}m"
 
 def update_runtime(force_update=False):
-    """Update runtime without MQTT dependency"""
+    """Update daily runtime tracking in seconds"""
     current_time = time.time()
-    
+
     if thermo_state.current_relay_state and thermo_state.heater_start_time > 0:
         if thermo_state.last_runtime_update == 0:
             thermo_state.last_runtime_update = thermo_state.heater_start_time
-            
-        minutes_since_update = (current_time - thermo_state.last_runtime_update) / 60
-        
-        if force_update or minutes_since_update >= 1:
-            thermo_state.daily_runtime += minutes_since_update
-            thermo_state.last_runtime_update = current_time
-            return True  # Indicate an update occurred
+            return False
+
+        # Calculate the current runtime since the heater was turned on
+        current_runtime = current_time - thermo_state.heater_start_time 
+
+        # Only update if forced OR the current runtime has increased
+        if force_update or current_runtime > thermo_state.daily_runtime_seconds:
+            thermo_state.daily_runtime_seconds = current_runtime 
+            return True
     
     return False
+
+def get_runtime_minutes():
+    """Convert runtime seconds to minutes for display/calculations"""
+    return thermo_state.daily_runtime_seconds / 60

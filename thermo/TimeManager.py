@@ -36,11 +36,14 @@ class TimeManager:
         return last_sync
         
     def update_system_time(self, current_time):
-        """Update system time from epoch timestamp"""
-        time_tuple = time.gmtime(current_time)
+        """Update system time from epoch timestamp, adjusting for MDT (UTC-6)"""
+        # Adjust epoch time for MDT (subtract 6 hours worth of seconds)
+        local_time = current_time - (6 * 3600)
+        
+        time_tuple = time.gmtime(local_time)
         machine.RTC().datetime((time_tuple[0], time_tuple[1], time_tuple[2], 
                               time_tuple[6] + 1, time_tuple[3], time_tuple[4], 
                               time_tuple[5], 0))
-        log(f"System time updated to: {time_tuple}")
-        return current_time
+        log(f"System time updated to MDT: {time_tuple}")
+        return current_time  # Return original UTC time for last_sync
   

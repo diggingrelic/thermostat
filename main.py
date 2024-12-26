@@ -138,6 +138,30 @@ def get_initial_state(client, retries=3):
     
     return False
 
+def handle_exception(e, debug=False):
+    """
+    Handles exceptions gracefully.
+
+    Args:
+        e (Exception): The exception object.
+        debug (bool): If True, prints a detailed traceback. Defaults to False.
+    """
+
+    if debug:
+        # Create string buffer for traceback
+        import io
+        output = io.StringIO()
+        log(f"Error: {type(e).__name__}: {str(e)}")
+        # Simulate traceback by printing the exception type and value
+        log("Traceback (most recent call last):")
+        log("  File \"<stdin>\", line 1, in <module>")
+        log(f"{type(e).__name__}: {str(e)}\n")
+
+        # Log the full traceback
+        log(output.getvalue())
+    else:
+        log(f"Error: {e}")
+
 def main():
     feed_watchdog()
 
@@ -214,23 +238,7 @@ def main():
                         state.client.send_queue()
                         time.sleep(1)  # Reduce sleep time between checks
                     except Exception as e:
-                        if config.debug:
-                            import sys
-                            import io
-                            import traceback
-
-                            # Create string buffer for traceback
-                            output = io.StringIO()
-                            
-                            # Get full traceback
-                            exc_type, exc_value, exc_traceback = sys.exc_info()
-                            traceback.print_exception(exc_type, exc_value, exc_traceback, file=output)
-                            
-                            # Log the full traceback
-                            log(f"Main loop error: {type(e).__name__}: {str(e)}")
-                            log(f"Traceback:\n{output.getvalue()}")
-                        else:
-                            log(f"Main loop error: {e}")
+                        handle_exception(e, debug=config.debug)
                         
                         set_mqtt_connected(False)
                         time.sleep(1)
@@ -303,55 +311,23 @@ def main():
                     if current_time - last_runtime_update >= 60:
                         if update_runtime():  # If runtime was updated
                             # Check if it's time for 15-minute status
-                            if current_time - state.last_runtime_status >= 900:  # 15 minutes = 900 seconds
-                                runtime_msg = format_runtime(state.daily_runtime)
-                                send_status(state.client, f"OK RUNTIME: {runtime_msg}")
+                            if current_time - state.last_runtime_status >= 900:  # 15 minutes
+                                runtime_str = format_runtime(state.daily_runtime_seconds)
+                                send_status(state.client, f"OK RUNTIME: {runtime_str}")
                                 state.last_runtime_status = current_time
                         last_runtime_update = current_time
 
                     feed_watchdog()
 
                 except Exception as e:
-                    if config.debug:
-                        import sys
-                        import io
-                        import traceback
-
-                        # Create string buffer for traceback
-                        output = io.StringIO()
-                        
-                        # Get full traceback
-                        exc_type, exc_value, exc_traceback = sys.exc_info()
-                        traceback.print_exception(exc_type, exc_value, exc_traceback, file=output)
-                        
-                        # Log the full traceback
-                        log(f"Main loop error: {type(e).__name__}: {str(e)}")
-                        log(f"Traceback:\n{output.getvalue()}")
-                    else:
-                        log(f"Main loop error: {e}")
+                    handle_exception(e, debug=config.debug)
                     
                     set_mqtt_connected(False)
                     running = False
                     continue
 
         except Exception as e:
-            if config.debug:
-                import sys
-                import io
-                import traceback
-
-                # Create string buffer for traceback
-                output = io.StringIO()
-                
-                # Get full traceback
-                exc_type, exc_value, exc_traceback = sys.exc_info()
-                traceback.print_exception(exc_type, exc_value, exc_traceback, file=output)
-                
-                # Log the full traceback
-                log(f"Main loop error: {type(e).__name__}: {str(e)}")
-                log(f"Traceback:\n{output.getvalue()}")
-            else:
-                log(f"Main loop error: {e}")
+            handle_exception(e, debug=config.debug)
             
             set_mqtt_connected(False)
             time.sleep(1)

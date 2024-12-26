@@ -16,8 +16,8 @@ class CostCalculator:
             state = get_state()
             # Only post once per day
             if state.last_daily_post != current_time[7]:  # current_time[7] is day of year
-                # Convert runtime from minutes to hours and calculate cost
-                daily_cost = (state.daily_runtime / 60) * config.HEATER_COST_PER_HOUR
+                # Convert runtime from seconds to hours and calculate cost
+                daily_cost = (state.daily_runtime_seconds / 3600) * config.HEATER_COST_PER_HOUR
                 send_daily_cost(daily_cost)
                 state.last_daily_post = current_time[7]
-                state.daily_runtime = 0
+                state.daily_runtime_seconds = 0  # Reset after posting

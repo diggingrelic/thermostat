@@ -98,8 +98,6 @@ def get_initial_state(client, retries=3):
         time.sleep(.1)
         client.publish(config.AIO_FEED_MIN_TIME_ON + "/get", "")
         time.sleep(.1)
-        client.subscribe("time/seconds")
-        time.sleep(.1)
         
         timeout = time.time() + 5
         while time.time() < timeout:
@@ -203,19 +201,37 @@ def main():
                         continue
                         
                     # Handle MQTT connection state
-                    client = handle_mqtt_connection(state.client, state)
-                    if not client or state.mqtt_state != config.MQTT_STATE_CONNECTED:
+                    handle_mqtt_connection(state)
+                    if not state.client or state.mqtt_state != config.MQTT_STATE_CONNECTED:
                         time.sleep(1)
                         feed_watchdog()
                         continue
                         
                     try:
                         feed_watchdog()
-                        client.ping()
-                        client.check_msg()
-                        client.send_queue()
+                        state.client.ping()
+                        state.client.check_msg()
+                        state.client.send_queue()
+                        time.sleep(1)  # Reduce sleep time between checks
                     except Exception as e:
-                        log(f"Main loop error: {e}")
+                        if config.debug:
+                            import sys
+                            import io
+                            import traceback
+
+                            # Create string buffer for traceback
+                            output = io.StringIO()
+                            
+                            # Get full traceback
+                            exc_type, exc_value, exc_traceback = sys.exc_info()
+                            traceback.print_exception(exc_type, exc_value, exc_traceback, file=output)
+                            
+                            # Log the full traceback
+                            log(f"Main loop error: {type(e).__name__}: {str(e)}")
+                            log(f"Traceback:\n{output.getvalue()}")
+                        else:
+                            log(f"Main loop error: {e}")
+                        
                         set_mqtt_connected(False)
                         time.sleep(1)
                         continue
@@ -224,8 +240,6 @@ def main():
 
                     # Time sync check (only when needed)
                     state.last_sync = time_manager.check_sync_needed(state.last_sync)
-                    if time_manager.sync_needed:
-                        state.client.publish(f"{config.AIO_USERNAME}/feeds/time/get", "")
 
                     try:
                         feed_watchdog()
@@ -234,14 +248,14 @@ def main():
                         # Only log if significant change
                         if last_logged_temp is None or abs(temperature - last_logged_temp) > 1:
                             last_logged_temp = temperature
-                            send_status(client, f"OK TEMP: {temperature:.2f} F")
+                            send_status(state.client, f"OK TEMP: {temperature:.2f} F")
                             
                         # Always publish every 60 seconds to Adafruit IO
                         if current_time - last_temp_update >= 20:
-                            client.publish(config.AIO_FEED_TEMP, f"{temperature:.2f}")
+                            state.client.publish(config.AIO_FEED_TEMP, f"{temperature:.2f}")
                             last_temp_update = current_time
                             
-                        relay_control.update_relay_state(temperature, client, state)
+                        relay_control.update_relay_state(temperature, state)
 
                         # Update runtime and daily cost
                         if update_runtime(force_update=True):
@@ -260,10 +274,10 @@ def main():
 
                     except RuntimeError as e:
                         error_msg = f"ERROR: Temperature sensor - {str(e)}"
-                        send_status(client, error_msg, force=True)
+                        send_status(state.client, error_msg, force=True)
                         continue
 
-                    wifi.log_wifi_status(client)
+                    wifi.log_wifi_status(state.client)
                     feed_watchdog()
                     time.sleep(5)
                     feed_watchdog()
@@ -275,14 +289,14 @@ def main():
                             state.timer_end_time = 0
                             state.current_timer_hours = 0
                             state.relay_state = False
-                            client.publish(config.AIO_FEED_RELAY, "OFF")
-                            client.publish(config.AIO_FEED_TIMER, "0")
+                            state.client.publish(config.AIO_FEED_RELAY, "OFF")
+                            state.client.publish(config.AIO_FEED_TIMER, "0")
                             log("Timer expired, relay commanded OFF")
                         elif current_time - last_timer_check >= 60:  # Update every minute
                             remaining_hours = (state.timer_end_time - current_time) / 3600
                             if remaining_hours != state.current_timer_hours:
                                 state.current_timer_hours = remaining_hours
-                                client.publish(config.AIO_FEED_TIMER, f"R:{remaining_hours:.2f}")
+                                state.client.publish(config.AIO_FEED_TIMER, f"R:{remaining_hours:.2f}")
                             last_timer_check = current_time
 
                     # Periodic runtime update (every minute)
@@ -291,20 +305,54 @@ def main():
                             # Check if it's time for 15-minute status
                             if current_time - state.last_runtime_status >= 900:  # 15 minutes = 900 seconds
                                 runtime_msg = format_runtime(state.daily_runtime)
-                                send_status(client, f"OK RUNTIME: {runtime_msg}")
+                                send_status(state.client, f"OK RUNTIME: {runtime_msg}")
                                 state.last_runtime_status = current_time
                         last_runtime_update = current_time
 
                     feed_watchdog()
 
                 except Exception as e:
-                    log(f"Main loop error: {e}")
+                    if config.debug:
+                        import sys
+                        import io
+                        import traceback
+
+                        # Create string buffer for traceback
+                        output = io.StringIO()
+                        
+                        # Get full traceback
+                        exc_type, exc_value, exc_traceback = sys.exc_info()
+                        traceback.print_exception(exc_type, exc_value, exc_traceback, file=output)
+                        
+                        # Log the full traceback
+                        log(f"Main loop error: {type(e).__name__}: {str(e)}")
+                        log(f"Traceback:\n{output.getvalue()}")
+                    else:
+                        log(f"Main loop error: {e}")
+                    
                     set_mqtt_connected(False)
                     running = False
                     continue
 
         except Exception as e:
-            log(f"Main loop error: {e}")
+            if config.debug:
+                import sys
+                import io
+                import traceback
+
+                # Create string buffer for traceback
+                output = io.StringIO()
+                
+                # Get full traceback
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+                traceback.print_exception(exc_type, exc_value, exc_traceback, file=output)
+                
+                # Log the full traceback
+                log(f"Main loop error: {type(e).__name__}: {str(e)}")
+                log(f"Traceback:\n{output.getvalue()}")
+            else:
+                log(f"Main loop error: {e}")
+            
             set_mqtt_connected(False)
             time.sleep(1)
 

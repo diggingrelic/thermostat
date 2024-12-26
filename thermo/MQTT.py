@@ -1,11 +1,12 @@
 import time
-import gc
+#import gc
 import config as config
 from umqtt.robust2 import MQTTClient
 from mysecrets import AIO_USERNAME, AIO_KEY
 from thermo.Log import log
 from thermo.Temperature import Temperature
 from thermo.ThermoState import get_state, format_runtime
+import random
 
 temperatures = Temperature()
 
@@ -15,16 +16,13 @@ last_mqtt_attempt = 0
 timer_end_time = 0
 current_timer_hours = 0
 
-MQTT_KEEPALIVE = 60
+MQTT_KEEPALIVE = 600
 MQTT_RECONNECT_DELAY = 5
 status_update_interval = 300  # 5 minutes for OK updates
 
 # Add these at the module level (near the top with other initializations)
 last_status_message = ""  # Track last message to prevent duplicates
 last_status_update = 0    # Track when last status was sent
-
-global client
-client = thermo_state.client
 
 def callback_wrapper(topic, msg, *args):
     """Wrapper for MQTT callback to handle exceptions"""
@@ -36,106 +34,66 @@ def callback_wrapper(topic, msg, *args):
         log(f"Args received: {all_args}")
 
 def create_mqtt_client():
+    """Create MQTT client with appropriate settings"""
     client = MQTTClient(
-        client_id="pico",
+        client_id=f"pico_{random.randint(0, 1000000)}",  # Add random ID to prevent conflicts
         server=config.AIO_SERVER,
         port=config.AIO_PORT,
         user=AIO_USERNAME,
         password=AIO_KEY,
         keepalive=MQTT_KEEPALIVE,
-        socket_timeout=5,
-        message_timeout=10
+        socket_timeout=30,
+        message_timeout=60
     )
-
     return client
 
-def reconnect_with_backoff(client, max_retries=5):
-    """Reconnect to MQTT with exponential backoff"""
-    state = get_state()# Get state object
-    delay = MQTT_RECONNECT_DELAY
-    for attempt in range(max_retries):
-        try:
-            log(f"Reconnecting to MQTT broker, attempt {attempt + 1}...")
-            try:
-                client.disconnect()
-            except Exception as e:
-                log(f"Error during disconnect: {e}")
-            
-            time.sleep(1)
-            gc.collect()
-
-            client = create_mqtt_client()
-            client.connect()
-            time.sleep(1)
-            
-            for feed in config.SUBSCRIBE_FEEDS:
-                client.subscribe(feed)
-                
-            log("Reconnected and subscribed to feeds.")
-            send_status(client, "OK RECONNECT: MQTT restored")
-            state.mqtt_state = config.MQTT_STATE_CONNECTED
-            return client
-            
-        except Exception as e:
-            log(f"Reconnection attempt {attempt + 1} failed: {e}")
-            send_status(client, f"ERROR: MQTT reconnect failed - attempt {attempt + 1}")
-            delay *= 2  # Exponential backoff
-            if attempt < max_retries - 1:
-                time.sleep(delay)
-
-    log("Failed to reconnect after multiple attempts.")
-    state.mqtt_state = config.MQTT_STATE_DISCONNECTED
-    return None
-
-def handle_mqtt_connection(client, state):
+def handle_mqtt_connection(state):
     """Handle MQTT connection state"""
     
     # If client is None, create a new one
-    if client is None:
+    if state.client is None:
         log("Creating new MQTT client")
-        client = create_mqtt_client()
-        client.set_callback(callback_wrapper)
-        thermo_state.client = client  # Store in state
+        state.client = create_mqtt_client()
+        state.client.set_callback(callback_wrapper)
         
-    if client and not client.is_conn_issue():
-        return client
-        
+    if state.client and not state.client.is_conn_issue():
+        log("MQTT connection check - no issues detected.")
+        return
+    log("MQTT connection check - issues detected.")
     # Connection issue detected
     set_mqtt_connected(False)
     state.mqtt_state = config.MQTT_STATE_DISCONNECTED
     
     try:
-        if client:
-            client.disconnect()
+        if state.client:
+            state.client.disconnect()
     except Exception as e:
         log(f"Error during disconnect: {e}")
     
     try:
         # Create new client if needed
-        if client is None:
-            client = create_mqtt_client()
-            client.set_callback(callback_wrapper)
-            thermo_state.client = client  # Store in state
+        if state.client is None:
+            state.client = create_mqtt_client()
+            state.client.set_callback(callback_wrapper)
             
         # Attempt reconnection
-        client.connect()
+        state.client.connect()
         set_mqtt_connected(True)
         state.mqtt_state = config.MQTT_STATE_CONNECTED
-        thermo_state.client = client  # Ensure state has latest client
         
         # Resubscribe to all topics
         for feed in config.SUBSCRIBE_FEEDS:
-            client.subscribe(feed)
-            time.sleep(1)
+            state.client.subscribe(feed)
+            time.sleep(0.1)
             
-        send_status(client, "OK RECONNECT: MQTT restored")
-        return client
+        send_status(state.client, "OK RECONNECT: MQTT restored")
+        return
             
     except Exception as e:
         log(f"Reconnection error: {e}")
         time.sleep(5)
         
-    return client
+    return
 
 def set_mqtt_connected(connected):
     """Update MQTT connection state"""
@@ -152,13 +110,8 @@ def mqtt_callback(topic, msg):
     msg_str = msg.decode()
     
     log(f"MQTT message received - Topic: {topic_str}, Message: {msg_str}")
-    
-    if topic_str == "time/seconds":
-        log("Time message received - Processing update from Adafruit IO")
-        thermo_state.last_sync = thermo_state.timeManager.handle_time_message(msg, thermo_state.last_sync)
-        log(f"Time sync complete - New last_sync: {thermo_state.last_sync}")
 
-    elif topic_str == config.AIO_FEED_TIMER:        
+    if topic_str == config.AIO_FEED_TIMER:        
         try:
             if msg_str.startswith('R:'):  # Handle remaining time updates
                 if thermo_state.timer_end_time == 0:  # Only process if we're initializing
@@ -280,10 +233,10 @@ def get_time_for_manager():
     thermo_state.client.publish(f"{AIO_USERNAME}/feeds/time/get", "")
 
 def send_daily_cost(daily_cost):
-    client.publish(config.AIO_FEED_DAILY_COST, f"{daily_cost:.2f}")
+    thermo_state.client.publish(config.AIO_FEED_DAILY_COST, f"{daily_cost:.2f}")
     log(f"Daily cost posted: ${daily_cost:.2f} ({thermo_state.daily_runtime} minutes)")
-    send_status(client, f"OK DAILY: Cost=${daily_cost:.2f} Runtime={format_runtime(thermo_state.daily_runtime)}")
-    send_status(client, f"OK RESET: Daily runtime reset from {format_runtime(thermo_state.daily_runtime)} to 0")
+    send_status(thermo_state.client, f"OK DAILY: Cost=${daily_cost:.2f} Runtime={format_runtime(thermo_state.daily_runtime)}")
+    send_status(thermo_state.client, f"OK RESET: Daily runtime reset from {format_runtime(thermo_state.daily_runtime)} to 0")
 
 def send_status(client, message, force=False):
     global last_status_message, last_status_update

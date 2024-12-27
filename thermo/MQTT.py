@@ -43,7 +43,7 @@ def create_mqtt_client():
         password=AIO_KEY,
         keepalive=MQTT_KEEPALIVE,
         socket_timeout=30,
-        message_timeout=60
+        message_timeout=10
     )
     return client
 
@@ -152,14 +152,17 @@ def mqtt_callback(topic, msg):
     elif topic_str == config.AIO_FEED_RELAY:
         new_relay_state = msg_str.lower() == "on"
         if new_relay_state != thermo_state.relay_state:
+            log("About to update relay state")
             thermo_state.relay_state = new_relay_state
             # Clear timer if relay commanded OFF
             if not thermo_state.relay_state and thermo_state.timer_end_time > 0:
+                log("About to clear timer")
                 thermo_state.timer_end_time = 0
                 thermo_state.current_timer_hours = 0
-                thermo_state.client.publish(config.AIO_FEED_TIMER, "0")  # Update timer feed
+                log("About to publish timer update")
+                thermo_state.client.publish(config.AIO_FEED_TIMER, "0")
                 log("Timer cancelled due to relay OFF command")
-            log(f"Relay command received: {thermo_state.relay_state} (Actual state: {thermo_state.current_relay_state}, min time holding: {thermo_state.current_relay_state and not thermo_state.relay_state})")
+            #log(f"Relay command received: {thermo_state.relay_state} (Actual state: {thermo_state.current_relay_state}, min time holding: {thermo_state.current_relay_state and not thermo_state.relay_state})")
         else:
             log(f"Relay command unchanged: command={thermo_state.relay_state}, actual={thermo_state.current_relay_state}")
 

@@ -29,7 +29,7 @@ class RelayControl:
                         turn_off_relay(state)
                         send_status(state.client, f"Relay commanded ON but temperature {temperature:.1f} F is above high limit {temp_high:.1f} F")
             else:
-                if min_runtime_passed(state, state.min_time_on):
+                if min_runtime_passed(state):
                     turn_off_relay(state)
                     send_status(state.client, "Relay commanded OFF")
             return
@@ -37,7 +37,6 @@ class RelayControl:
 
 #Helper functions
 def turn_on_relay(state):
-    
     state.relay_pin.on()
     state.led.on()
     state.current_relay_state = True
